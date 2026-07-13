@@ -1,80 +1,179 @@
+#!/usr/bin/env node
 'use strict';
-// ========== 飞书应用机器人（L2：交互命令）==========
-// 用户 @机器人 发送 /sou /debug /stop /status 命令
-// 需要用户在飞书开放平台创建应用并配置事件订阅
+// ========== Feishu interactive bot (experimental, opt-in only) ==========
 
+const http = require('http');
 const https = require('https');
-const http  = require('http');
-const crypto = require('crypto');
-const fs     = require('fs');
-const path   = require('path');
-const { execSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const config = require('../lib/config');
 
-// ── 配置读取 ──
-function loadConfig() {
-  const envFile = process.env.V2EX_ENV_FILE || path.join(require('os').homedir(), '.v2ex_env');
-  if (fs.existsSync(envFile)) {
-    const lines = fs.readFileSync(envFile, 'utf8').split('\n');
-    for (const line of lines) {
-      const m = line.match(/^([A-Z_]+)=(.+)$/);
-      if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
-    }
-  }
-  return {
-    appId:             process.env.FEISHU_APP_ID     || '',
-    appSecret:         process.env.FEISHU_APP_SECRET || '',
-    verificationToken: process.env.FEISHU_VERIFICATION_TOKEN || '',
-    port:              parseInt(process.env.FEISHU_BOT_PORT || '6700', 10),
-  };
+const cfg = config.getConfig();
+const LOCK_FILE = path.join(os.tmpdir(), 'v2ex_reader.lock');
+
+let tenantToken = '';
+let tokenExpiresAt = 0;
+
+function maskId(id) {
+  const s = String(id || '');
+  if (s.length <= 4) return '****';
+  return `${s.slice(0, 2)}***${s.slice(-2)}`;
 }
 
-let cfg;
-let tenantToken = null;
-let tokenExpiry = 0;
+function readJsonFile(file) {
+  try {
+    if (!fs.existsSync(file)) return null;
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
 
-// ── 飞书 API：获取 tenant_access_token ──
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function formatCoins(entry) {
+  if (!entry) return '暂无记录';
+  const parts = [];
+  if (entry.gold) parts.push(`${entry.gold} 金币`);
+  if (entry.silver) parts.push(`${entry.silver} 银币`);
+  const copper = entry.copper !== undefined ? entry.copper : entry.last;
+  parts.push(`${copper || 0} 铜币`);
+  return parts.join(', ');
+}
+
+function buildBalanceText() {
+  const status = readJsonFile(cfg.balanceStatus);
+  const log = readJsonFile(cfg.balanceLog);
+  const days = log
+    ? Object.keys(log).filter(k => /^\d{4}-\d{2}-\d{2}$/.test(k)).sort().reverse()
+    : [];
+
+  const lines = ['V2EX 余额记录'];
+  if (!log || days.length === 0) {
+    lines.push('今日：暂无记录');
+  } else {
+    const today = days[0];
+    const yesterday = days[1];
+    lines.push(`今日 (${today})：${formatCoins(log[today])}`);
+    if (yesterday) lines.push(`昨日 (${yesterday})：${formatCoins(log[yesterday])}`);
+  }
+
+  if (status) {
+    const ok = status.ok ? '成功' : '失败';
+    const httpStatus = status.statusCode ? ` / HTTP ${status.statusCode}` : '';
+    lines.push(`最近一次余额检查：${ok}${httpStatus}`);
+    if (status.message || status.code) lines.push(`状态：${status.message || status.code}`);
+  }
+  return lines.join('\n');
+}
+
+function buildStatusText() {
+  const lines = [`V2EX Helper 状态 (profile=${cfg.profile})`];
+  lines.push(`Cookie：${fs.existsSync(cfg.cookieFile) ? '已存在' : '未找到'}`);
+  lines.push(`余额日志：${fs.existsSync(cfg.balanceLog) ? '已存在' : '未找到'}`);
+  if (!fs.existsSync(LOCK_FILE)) {
+    lines.push('阅读任务：空闲');
+    return lines.join('\n');
+  }
+
+  const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
+  if (pid && isProcessAlive(pid)) {
+    lines.push(`阅读任务：运行中 (PID ${pid})`);
+  } else {
+    lines.push(`阅读任务：残留锁文件 (PID ${pid || 'unknown'} 不存在)`);
+  }
+  return lines.join('\n');
+}
+
+function readDebugText() {
+  try {
+    if (!fs.existsSync(cfg.readerLog)) return '暂无 reader 日志';
+    const data = fs.readFileSync(cfg.readerLog, 'utf8');
+    const lines = data.split(/\r?\n/).filter(Boolean).slice(-8);
+    return lines.length > 0 ? lines.join('\n') : '暂无 reader 日志';
+  } catch (e) {
+    return `读取日志失败：${e.message}`;
+  }
+}
+
+function stopReaderText() {
+  try {
+    if (!fs.existsSync(LOCK_FILE)) return '阅读脚本未在运行（锁文件不存在）';
+    const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
+    if (!pid || Number.isNaN(pid)) return '锁文件 PID 无效';
+    if (!isProcessAlive(pid)) {
+      try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
+      return '进程已不存在，锁文件已清理';
+    }
+    process.kill(pid, 'SIGTERM');
+    return `已向阅读进程 PID ${pid} 发送停止信号`;
+  } catch (e) {
+    return `停止失败：${e.message}`;
+  }
+}
+
 function getTenantToken() {
-  if (tenantToken && Date.now() < tokenExpiry) return Promise.resolve(tenantToken);
-  if (!cfg.appId || !cfg.appSecret) return Promise.reject(new Error('未配置 FEISHU_APP_ID / FEISHU_APP_SECRET'));
+  if (tenantToken && Date.now() < tokenExpiresAt) return Promise.resolve(tenantToken);
+  const body = JSON.stringify({
+    app_id: cfg.feishu.appId,
+    app_secret: cfg.feishu.appSecret,
+  });
 
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ app_id: cfg.appId, app_secret: cfg.appSecret });
     const req = https.request({
       hostname: 'open.feishu.cn',
       path: '/open-apis/auth/v3/tenant_access_token/internal',
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
     }, (res) => {
       let data = '';
-      res.on('data', d => data += d);
+      res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
-          const j = JSON.parse(data);
-          if (j.code === 0) {
-            tenantToken = j.tenant_access_token;
-            tokenExpiry = Date.now() + (j.expire - 60) * 1000;
-            resolve(tenantToken);
-          } else reject(new Error(`Token error: ${j.msg} (${j.code})`));
-        } catch(e) { reject(e); }
+          const parsed = JSON.parse(data);
+          if (parsed.code !== 0) {
+            reject(new Error(parsed.msg || `tenant token error ${parsed.code}`));
+            return;
+          }
+          tenantToken = parsed.tenant_access_token;
+          tokenExpiresAt = Date.now() + Math.max(60, (parsed.expire || 7200) - 60) * 1000;
+          resolve(tenantToken);
+        } catch (e) {
+          reject(e);
+        }
       });
     });
     req.on('error', reject);
-    req.setTimeout(10000, () => req.destroy());
-    req.write(body); req.end();
+    req.setTimeout(10000, () => req.destroy(new Error('feishu token timeout')));
+    req.write(body);
+    req.end();
   });
 }
 
-// ── 飞书 API：发送消息到群 ──
-function sendFeishuMessage(chatId, text) {
-  return getTenantToken().then(token => new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      receive_id: chatId,
-      msg_type: 'text',
-      content: JSON.stringify({ text }),
-    });
+async function sendFeishuMessage(chatId, text) {
+  if (!chatId) return;
+  const token = await getTenantToken();
+  const body = JSON.stringify({
+    receive_id: chatId,
+    msg_type: 'text',
+    content: JSON.stringify({ text }),
+  });
+
+  return new Promise((resolve, reject) => {
     const req = https.request({
       hostname: 'open.feishu.cn',
-      path: `/open-apis/im/v1/messages?receive_id_type=chat_id`,
+      path: '/open-apis/im/v1/messages?receive_id_type=chat_id',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -83,187 +182,175 @@ function sendFeishuMessage(chatId, text) {
       },
     }, (res) => {
       let data = '';
-      res.on('data', d => data += d);
+      res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
-          const j = JSON.parse(data);
-          if (j.code === 0) resolve(j);
-          else reject(new Error(`Send msg error: ${j.msg}`));
-        } catch(e) { reject(e); }
+          const parsed = JSON.parse(data || '{}');
+          if (parsed.code && parsed.code !== 0) {
+            reject(new Error(parsed.msg || `send message error ${parsed.code}`));
+            return;
+          }
+          resolve(parsed);
+        } catch (e) {
+          reject(e);
+        }
       });
     });
     req.on('error', reject);
-    req.setTimeout(10000, () => req.destroy());
-    req.write(body); req.end();
-  }));
+    req.setTimeout(10000, () => req.destroy(new Error('feishu message timeout')));
+    req.write(body);
+    req.end();
+  });
 }
 
-// ── 命令处理 ──
-async function handleCommand(cmd, chatId, senderName) {
-  const nameTag = senderName ? `@${senderName} ` : '';
-  try {
-    switch (cmd) {
-      case '/help':
-        await sendFeishuMessage(chatId,
-          `${nameTag}📋 V2EX Helper 命令：\n` +
-          `• /sou — 查询余额\n` +
-          `• /status — 查看运行状态\n` +
-          `• /debug — 查看最近日志\n` +
-          `• /stop — 停止阅读器`
-        );
-        break;
-
-      case '/sou':
-      case '/balance':
-        try {
-          const result = execSync(
-            'cd /root/v2ex-max-helper/checkin && node --require /root/v2ex-max-helper/checkin/preload-proxy.js v2ex-checkin.js 2>&1',
-            { timeout: 25000, encoding: 'utf8' }
-          );
-          const balance = (result.match(/Balance\s*:\s*[^\n]+/) || ['未知'])[0];
-          const status  = (result.match(/Status\s*:\s*[^\n]+/) || ['未知'])[0];
-          await sendFeishuMessage(chatId, `${nameTag}💰 ${balance}\n📊 ${status}`);
-        } catch(e) {
-          await sendFeishuMessage(chatId, `${nameTag}❌ 查询失败: ${e.message}`);
-        }
-        break;
-
-      case '/status':
-        try {
-          const proxy = execSync('systemctl is-active mihomo 2>/dev/null', { encoding: 'utf8' }).trim();
-          const checkin = execSync('systemctl is-enabled v2ex-checkin.timer 2>/dev/null || echo disabled', { encoding: 'utf8' }).trim();
-          const reader = execSync('systemctl is-enabled v2ex-reader.timer 2>/dev/null || echo disabled', { encoding: 'utf8' }).trim();
-          await sendFeishuMessage(chatId,
-            `${nameTag}📊 V2EX Helper 状态：\n` +
-            `• 代理: ${proxy === 'active' ? '✅' : '❌'}\n` +
-            `• 签到定时器: ${checkin === 'enabled' ? '✅' : '❌'}\n` +
-            `• 阅读定时器: ${reader === 'enabled' ? '✅' : '❌'}\n` +
-            `• 服务器: 8.135.36.248`
-          );
-        } catch(e) {
-          await sendFeishuMessage(chatId, `${nameTag}❌ 查询失败: ${e.message}`);
-        }
-        break;
-
-      case '/debug':
-        try {
-          const logs = execSync(
-            'journalctl -u v2ex-checkin -u v2ex-reader --no-pager -n 8 2>/dev/null',
-            { timeout: 5000, encoding: 'utf8' }
-          );
-          const lines = logs.split('\n').filter(l => l.includes('node[') || l.includes('签到') || l.includes('ERROR')).slice(-5);
-          await sendFeishuMessage(chatId, `${nameTag}🔍 最近日志：\n${lines.join('\n') || '(无)'}`);
-        } catch(e) {
-          await sendFeishuMessage(chatId, `${nameTag}❌ 查询失败: ${e.message}`);
-        }
-        break;
-
-      case '/stop':
-        try {
-          execSync('systemctl stop v2ex-reader 2>/dev/null', { timeout: 5000 });
-          await sendFeishuMessage(chatId, `${nameTag}🛑 阅读器已停止`);
-        } catch(e) {
-          await sendFeishuMessage(chatId, `${nameTag}❌ 停止失败: ${e.message}`);
-        }
-        break;
-
-      default:
-        await sendFeishuMessage(chatId, `${nameTag}未知命令: ${cmd}\n发送 /help 查看可用命令`);
-    }
-  } catch(e) {
-    console.error('[feishu-bot] Command error:', e.message);
-  }
+function verifyToken(body) {
+  const token = cfg.feishu.verificationToken;
+  if (!token) return false;
+  const received = body.token || (body.header && body.header.token) || '';
+  return received === token;
 }
 
-// ── 签名校验 ──
-function verifySignature(timestamp, nonce, bodyStr, signature) {
-  if (!cfg.verificationToken) return true; // 未配 verification token 时跳过
-  const raw = `${timestamp}${nonce}${cfg.verificationToken}${bodyStr}`;
-  const expected = crypto.createHash('sha256').update(raw, 'utf8').digest('hex');
-  return signature === expected;
+function isAuthorizedChat(chatId) {
+  return Boolean(cfg.feishu.chatId && String(chatId || '') === cfg.feishu.chatId);
 }
 
-// ── 消息解析 ──
 function parseMessage(body) {
+  const event = body.event || {};
+  const msg = event.message || {};
+  let content = {};
   try {
-    const event = body.event || {};
-    const msg = event.message || {};
-    const content = msg.content || '{}';
-    let parsed;
-    try { parsed = JSON.parse(content); } catch(e) { parsed = {}; }
-    // 飞书消息文本（可能包含 @mention）
-    const text = (parsed.text || '').replace(/@_user_\d+/g, '').trim();
-    const chatId = msg.chat_id || event.chat_id || '';
-    const senderName = (event.sender || {}).sender_id?.open_id || '';
-    return { text, chatId, senderName };
-  } catch(e) {
-    return { text: '', chatId: '', senderName: '' };
+    content = JSON.parse(msg.content || '{}');
+  } catch (_) {}
+  const text = String(content.text || '')
+    .replace(/@\S+/g, '')
+    .replace(/@_user_\d+/g, '')
+    .trim();
+  return {
+    text,
+    chatId: msg.chat_id || event.chat_id || '',
+    senderId: ((event.sender || {}).sender_id || {}).open_id || '',
+  };
+}
+
+async function handleCommand(text, chatId, senderId) {
+  if (!isAuthorizedChat(chatId)) {
+    console.log(`[feishu-bot] ignored unauthorized chat: ${maskId(chatId)}`);
+    return { skipped: 'unauthorized_chat' };
+  }
+
+  const command = String(text || '').split(/\s+/)[0].toLowerCase();
+  const prefix = senderId ? `@${maskId(senderId)}\n` : '';
+  switch (command) {
+    case '/help':
+      return sendFeishuMessage(chatId,
+        `${prefix}可用命令：\n` +
+        '/sou - 查询余额记录\n' +
+        '/status - 查看运行状态\n' +
+        '/debug - 查看最近 reader 日志\n' +
+        '/stop - 停止正在运行的阅读脚本'
+      );
+    case '/sou':
+    case '/balance':
+      return sendFeishuMessage(chatId, `${prefix}${buildBalanceText()}`);
+    case '/status':
+      return sendFeishuMessage(chatId, `${prefix}${buildStatusText()}`);
+    case '/debug':
+      return sendFeishuMessage(chatId, `${prefix}${readDebugText()}`);
+    case '/stop':
+      return sendFeishuMessage(chatId, `${prefix}${stopReaderText()}`);
+    default:
+      return sendFeishuMessage(chatId, `${prefix}未知命令：${command || '(empty)'}\n发送 /help 查看可用命令。`);
   }
 }
 
-// ── HTTP 服务器 ──
-function startServer() {
+function createServer() {
   const server = http.createServer((req, res) => {
-    if (req.method === 'POST' && req.url === '/feishu/callback') {
-      let rawBody = '';
-      req.on('data', chunk => rawBody += chunk);
-      req.on('end', async () => {
-        try {
-          const body = JSON.parse(rawBody);
-
-          // URL 验证（飞书配置回调时）
-          if (body.type === 'url_verification') {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ challenge: body.challenge }));
-            console.log('[feishu-bot] URL verification OK');
-            return;
-          }
-
-          // 事件回调
-          if (body.header && body.header.event_type) {
-            const eventType = body.header.event_type;
-            console.log('[feishu-bot] Event:', eventType);
-
-            if (eventType === 'im.message.receive_v1') {
-              const { text, chatId, senderName } = parseMessage(body);
-              // 只响应 / 开头的命令
-              if (text.startsWith('/')) {
-                const spaceIdx = text.indexOf(' ');
-                const cmd = spaceIdx > 0 ? text.substring(0, spaceIdx) : text;
-                console.log(`[feishu-bot] Command: "${cmd}" from chat=${chatId}`);
-                await handleCommand(cmd, chatId, senderName);
-              }
-            }
-          }
-
-          res.writeHead(200);
-          res.end('{}');
-        } catch(e) {
-          console.error('[feishu-bot] Callback error:', e.message);
-          res.writeHead(400);
-          res.end('{}');
-        }
-      });
-    } else {
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('V2EX Feishu Bot OK');
+    if (req.method !== 'POST' || req.url !== '/feishu/callback') {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not Found');
+      return;
     }
-  });
 
-  server.listen(cfg.port, '0.0.0.0', () => {
-    console.log(`[feishu-bot] Listening on :${cfg.port}`);
-    console.log(`[feishu-bot] Callback URL: http://YOUR_IP:${cfg.port}/feishu/callback`);
+    let rawBody = '';
+    req.on('data', chunk => {
+      rawBody += chunk;
+      if (rawBody.length > 1024 * 1024) {
+        req.destroy();
+      }
+    });
+    req.on('end', async () => {
+      let body;
+      try {
+        body = JSON.parse(rawBody || '{}');
+      } catch (_) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+
+      if (!verifyToken(body)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end('{}');
+        return;
+      }
+
+      if (body.type === 'url_verification' && body.challenge) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ challenge: body.challenge }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+
+      if (body.header && body.header.event_type === 'im.message.receive_v1') {
+        const message = parseMessage(body);
+        if (message.text.startsWith('/')) {
+          try {
+            await handleCommand(message.text, message.chatId, message.senderId);
+          } catch (e) {
+            console.error(`[feishu-bot] command failed: ${e.message}`);
+          }
+        }
+      }
+    });
+  });
+  server.headersTimeout = 5000;
+  server.requestTimeout = 10000;
+  return server;
+}
+
+function main() {
+  if (!cfg.feishu.botEnabled) {
+    console.log('[feishu-bot] disabled. Set FEISHU_BOT_ENABLE=1 to start the experimental Feishu bot.');
+    return;
+  }
+  const required = [
+    ['FEISHU_APP_ID', cfg.feishu.appId],
+    ['FEISHU_APP_SECRET', cfg.feishu.appSecret],
+    ['FEISHU_VERIFICATION_TOKEN', cfg.feishu.verificationToken],
+    ['FEISHU_CHAT_ID', cfg.feishu.chatId],
+  ];
+  const missing = required.filter(([, value]) => !value).map(([name]) => name);
+  if (missing.length > 0) {
+    console.error(`[feishu-bot] missing required config when FEISHU_BOT_ENABLE=1: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+
+  const server = createServer();
+  server.listen(cfg.feishu.port, '0.0.0.0', () => {
+    console.log(`[feishu-bot] listening on :${cfg.feishu.port} for chat ${maskId(cfg.feishu.chatId)} (callback path: /feishu/callback)`);
   });
 }
 
-// ── 启动 ──
-cfg = loadConfig();
-if (!cfg.appId || !cfg.appSecret) {
-  console.warn('[feishu-bot] ⚠️  未配置 FEISHU_APP_ID / FEISHU_APP_SECRET');
-  console.warn('[feishu-bot] L2 交互命令需要飞书应用凭据，详见 docs/飞书应用机器人配置.md');
-  console.warn('[feishu-bot] 服务器仍会启动（可接收 webhook 推送），但不会响应交互命令');
+if (require.main === module) {
+  main();
 }
-if (!cfg.verificationToken) {
-  console.warn('[feishu-bot] ⚠️  未配置 FEISHU_VERIFICATION_TOKEN（建议配置以启用签名校验）');
-}
-startServer();
+
+module.exports = {
+  createServer,
+  parseMessage,
+  isAuthorizedChat,
+  buildBalanceText,
+  buildStatusText,
+};

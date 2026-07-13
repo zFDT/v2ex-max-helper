@@ -1,21 +1,21 @@
 #!/usr/bin/env node
 /**
  * V2EX 每日签到 - Node.js 独立版（含保活机制）
- * Version: v1.3.0
+ * Version: v1.3.5
  *
  * 用法：
  *   保存 Cookie：
  *     V2EX_COOKIE="..." node v2ex-checkin.js --save-cookie
  *
- *   每日签到（crontab 01:10 UTC = 北京 09:10）：
- *     10 1 * * * /usr/bin/node /path/to/v2ex-checkin.js >> /var/log/v2ex.log 2>&1
+ *   每日签到（crontab 按本机时间 09:10）：
+ *     10 9 * * * /usr/bin/node /path/to/v2ex-checkin.js >> /var/log/v2ex.log 2>&1
  *
  *   保活心跳，每6小时访问一次（防 Session 过期）：
  *     0 0,6,12,18 * * *  node /path/to/v2ex-checkin.js --ping
  *
  * 推送告警（Cookie 失效时通知）：
  *   Bark:     BARK_URL="https://api.day.app/你的KEY" node v2ex-checkin.js
- *   Telegram: TG_BOT_TOKEN="xxx" TG_CHAT_ID="xxx" node v2ex-checkin.js
+ *   Telegram: TG_TOKEN="xxx" TG_CHAT_ID="xxx" node v2ex-checkin.js
  *
  * Cookie 存储位置：~/.v2ex_cookie（或 COOKIE_FILE 环境变量）
  */
@@ -25,30 +25,24 @@
 const https = require('https');
 const http  = require('http');
 const fs    = require('fs');
-const path  = require('path');
-const os    = require('os');
 const url   = require('url');
+const config = require('../lib/config');
 
 // ========== 配置 ==========
-const SCRIPT_VERSION = 'v1.3.0';
+const SCRIPT_VERSION = 'v1.3.5';
 const HOST           = 'www.v2ex.com';
+const COOKIE_ORIGIN  = `https://${HOST}`;
 const MAX_RETRY      = 3;
 
-// 多账号：通过 V2EX_PROFILE 区分账号的 Cookie 文件
-//   default      → ~/.v2ex_cookie
-//   <profile>    → ~/.v2ex_cookie.<profile>
-//   COOKIE_FILE 环境变量显式指定时优先生效
-const PROFILE = (process.env.V2EX_PROFILE || 'default').trim() || 'default';
-const COOKIE_FILE = process.env.COOKIE_FILE
-  || (PROFILE === 'default'
-      ? path.join(os.homedir(), '.v2ex_cookie')
-      : path.join(os.homedir(), `.v2ex_cookie.${PROFILE}`));
+const cfg = config.getConfig();
+const COOKIE_FILE = cfg.cookieFile;
 
-// 推送配置（从环境变量读取，不硬编码）
-const BARK_URL       = process.env.BARK_URL    || '';   // e.g. https://api.day.app/YOUR_KEY
-const TG_BOT_TOKEN   = process.env.TG_BOT_TOKEN || '';
-const TG_CHAT_ID     = process.env.TG_CHAT_ID   || '';
-const FEISHU_WEBHOOK = process.env.FEISHU_WEBHOOK || '';
+// 推送配置（从环境变量或 ~/.v2ex_env 读取，不硬编码）
+const BARK_URL       = cfg.barkUrl;                 // e.g. https://api.day.app/YOUR_KEY
+const TG_BOT_TOKEN   = cfg.telegram.checkinToken;   // TG_BOT_TOKEN 优先，TG_TOKEN 兼容 fallback
+const TG_CHAT_ID     = cfg.telegram.chatId;
+const FEISHU_ENABLED = cfg.feishu.enabled;
+const FEISHU_WEBHOOK = cfg.feishu.webhook;
 
 const COMMON_HEADERS = {
   'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -61,6 +55,10 @@ const COMMON_HEADERS = {
 
 // ========== Cookie 存储 ==========
 function readCookie() {
+  // 如果 Cookie 文件不存在，但环境变量里有，则自动初始化
+  if (process.env.V2EX_COOKIE && !fs.existsSync(COOKIE_FILE)) {
+    writeCookie(process.env.V2EX_COOKIE);
+  }
   try {
     if (fs.existsSync(COOKIE_FILE)) return fs.readFileSync(COOKIE_FILE, 'utf8').trim();
   } catch (e) {}
@@ -69,7 +67,9 @@ function readCookie() {
 
 function writeCookie(cookie) {
   try {
-    fs.writeFileSync(COOKIE_FILE, cookie.trim(), { mode: 0o600 });
+    config.writeFileAtomic(COOKIE_FILE, cookie.trim(), { mode: 0o600 });
+    // 同步更新进程内 env（跨模块复用）
+    process.env.V2EX_COOKIE = cookie;
     return true;
   } catch (e) {
     console.error('写入 Cookie 失败:', e.message);
@@ -91,12 +91,14 @@ function cookieToMap(str) {
 }
 
 // 把服务端响应的 Set-Cookie 数组合并进现有 cookie 字符串（新值覆盖同名旧值）。
-// 这正是「自动刷新登录态」的核心：V2EX 的 A2 登录 cookie 会滑动续期，
-// 只要把每次响应里下发的新 A2 写回，登录态就能持续延长、无需重新登录。
+// 注意：普通访问经常只刷新 A2O / V2EX_LANG 等辅助字段，不代表核心 A2 已续期。
 function mergeSetCookies(currentCookie, setCookieArr) {
-  if (!setCookieArr || setCookieArr.length === 0) return { cookie: currentCookie, changed: false };
+  if (!setCookieArr || setCookieArr.length === 0) {
+    return { cookie: currentCookie, changed: false, changedKeys: [] };
+  }
   const map = cookieToMap(currentCookie);
   let changed = false;
+  const changedKeys = [];
   for (const sc of setCookieArr) {
     // 每条 Set-Cookie 形如 "A2=xxx; Path=/; Expires=...; HttpOnly"
     const first = sc.split(';')[0];
@@ -109,38 +111,72 @@ function mergeSetCookies(currentCookie, setCookieArr) {
     if (value === '' || value === 'deleted') continue;
     if (map.get(name) !== value) {
       map.set(name, value);
+      changedKeys.push(name);
       changed = true;
     }
   }
   const merged = Array.from(map.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
-  return { cookie: merged, changed };
+  return { cookie: merged, changed, changedKeys };
 }
 
 // 用响应的 Set-Cookie 刷新本地 cookie 文件（仅在有变化时写盘）
 function refreshCookieFromResponse(currentCookie, setCookieArr) {
-  const { cookie, changed } = mergeSetCookies(currentCookie, setCookieArr);
+  const { cookie, changed, changedKeys } = mergeSetCookies(currentCookie, setCookieArr);
   if (changed) {
     writeCookie(cookie);
-    log('🔄 登录态已自动续期（Set-Cookie 已写回）');
+    logCookieChanges(changedKeys);
   }
   return cookie;
+}
+
+function logCookieChanges(changedKeys) {
+  const authKeys = new Set(['A2', 'PB3_SESSION', 'cf_clearance']);
+  const uniqueKeys = [...new Set(changedKeys)];
+  const authChanged = uniqueKeys.filter(k => authKeys.has(k));
+  const auxChanged = uniqueKeys.filter(k => !authKeys.has(k));
+
+  if (authChanged.length > 0) {
+    log(`🔄 核心 Cookie 已更新: ${authChanged.join(', ')}`);
+  }
+  if (auxChanged.length > 0) {
+    log(`🔄 辅助 Cookie 已更新: ${auxChanged.join(', ')}`);
+  }
 }
 
 // ========== HTTP 请求 ==========
 // 完整版：返回 { body, setCookies }。会累积重定向链路上每一跳的 Set-Cookie。
 function fetchUrlFull(reqUrl, cookie, _redirects = 0, _acc = []) {
   return new Promise((resolve, reject) => {
-    const headers = Object.assign({}, COMMON_HEADERS, { Cookie: cookie });
-    const parsed  = new url.URL(reqUrl);
+    let parsed;
+    try {
+      parsed = new url.URL(reqUrl);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+
+    // 携带登录 Cookie 的请求只能发往 V2EX HTTPS 源，重定向递归也会重复校验。
+    if (cookie && parsed.origin !== COOKIE_ORIGIN) {
+      reject(new Error(`拒绝向非 V2EX HTTPS 源发送 Cookie: ${parsed.origin}`));
+      return;
+    }
+
+    const headers = Object.assign({}, COMMON_HEADERS);
+    if (cookie) headers.Cookie = cookie;
     const lib     = parsed.protocol === 'https:' ? https : http;
     const req = lib.get(reqUrl, { headers }, (res) => {
       const sc = res.headers['set-cookie'] || [];
       const acc = _acc.concat(sc);
       // 跟随重定向（最多3次）
       if ([301, 302, 303].includes(res.statusCode) && res.headers.location && _redirects < 3) {
-        const loc = res.headers.location.startsWith('http')
-          ? res.headers.location
-          : `https://${HOST}${res.headers.location}`;
+        let loc;
+        try {
+          loc = new url.URL(res.headers.location, parsed).toString();
+        } catch (e) {
+          res.resume();
+          reject(e);
+          return;
+        }
         res.resume();
         return fetchUrlFull(loc, cookie, _redirects + 1, acc).then(resolve).catch(reject);
       }
@@ -173,18 +209,31 @@ function sendTelegram(title, msg) {
 }
 
 function sendFeishu(title, msg) {
-  if (!FEISHU_WEBHOOK) return Promise.resolve();
-  const text = `V2EX｜${title}\n${msg}`;
-  const body = JSON.stringify({ msg_type: 'text', content: { text } });
-  const u = new URL(FEISHU_WEBHOOK);
+  if (!FEISHU_ENABLED || !FEISHU_WEBHOOK) return Promise.resolve();
   return new Promise((resolve) => {
-    const https = require('https');
+    let target;
+    try {
+      target = new url.URL(FEISHU_WEBHOOK);
+    } catch (_) {
+      resolve();
+      return;
+    }
+    const body = JSON.stringify({
+      msg_type: 'text',
+      content: { text: `V2EX | ${title}\n${msg}` },
+    });
     const req = https.request({
-      hostname: u.hostname,
-      path: u.pathname + u.search,
+      hostname: target.hostname,
+      path: `${target.pathname}${target.search}`,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, (res) => { res.resume(); res.on('end', resolve); });
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      res.resume();
+      res.on('end', resolve);
+    });
     req.on('error', resolve);
     req.setTimeout(10000, () => req.destroy());
     req.write(body);
@@ -238,9 +287,15 @@ async function queryBalance(cookie) {
 
 // ========== Logger ==========
 function pad(n) { return String(n).padStart(2, '0'); }
+function utcOffset(d) {
+  const minutes = -d.getTimezoneOffset();
+  const sign = minutes >= 0 ? '+' : '-';
+  const abs = Math.abs(minutes);
+  return `UTC${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
 function tsNow() {
   const d = new Date();
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} UTC`;
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${utcOffset(d)}`;
 }
 function log(msg) { console.log(msg); }
 function logField(label, value) {

@@ -1,0 +1,37 @@
+services:
+  v2ex-bot:
+    image: ghcr.io/mskatoni/v2ex-max-helper:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: v2ex-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - v2ex-data:/app/data
+    environment:
+      - TZ=UTC
+
+    mem_limit: 2g
+    mem_reservation: 512m
+
+    # ===== 安全加固 =====
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+
+    # 内存限制（防止 Chromium 吃光宿主机）
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+volumes:
+  v2ex-data:

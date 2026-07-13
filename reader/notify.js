@@ -1,46 +1,39 @@
 'use strict';
 // ========== Telegram 推送通知 ==========
 const https  = require('https');
-const fs     = require('fs');
-const path   = require('path');
-const logger = require('./logger');
+const config = require('../lib/config');
 
-// 从环境变量或 ~/.v2ex_env 文件读取配置
-function loadConfig() {
-  // 先尝试读取 env 文件
-  const envFile = path.join(require('os').homedir(), '.v2ex_env');
-  if (fs.existsSync(envFile)) {
-    const lines = fs.readFileSync(envFile, 'utf8').split('\n');
-    for (const line of lines) {
-      const m = line.match(/^([A-Z_]+)=(.+)$/);
-      if (m && !process.env[m[1]]) {
-        process.env[m[1]] = m[2].trim();
-      }
-    }
-  }
-  const webhook = process.env.FEISHU_WEBHOOK || '';
-  return {
-    token:  process.env.TG_TOKEN   || '',
-    webhook: process.env.FEISHU_WEBHOOK || '',
-    chatId: process.env.TG_CHAT_ID || '',
-  };
+const cfg = config.getConfig();
+
+function isTelegramConfigured() {
+  // 未配置 Token / Chat ID 时静默跳过推送，不影响主流程
+  return Boolean(cfg.telegram.token && cfg.telegram.chatId);
 }
 
-const cfg = loadConfig();
+function isFeishuConfigured() {
+  return Boolean(cfg.feishu.enabled && cfg.feishu.webhook);
+}
 
 function isConfigured() {
-  // 未配置 Token / Chat ID 时静默跳过推送，不影响主流程
-  return Boolean(cfg.token && cfg.chatId);
+  return isTelegramConfigured() || isFeishuConfigured();
 }
 
-function sendMessage(text) {
-  sendFeishu(text);  // 飞书推送不阻塞主流程
-  if (!isConfigured()) return Promise.resolve();
+function stripHtml(text) {
+  return String(text || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?(b|code|i|em|strong)>/gi, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function sendTelegram(text) {
+  if (!isTelegramConfigured()) return Promise.resolve();
   return new Promise((resolve) => {
-    const body = JSON.stringify({ chat_id: cfg.chatId, text, parse_mode: 'HTML' });
+    const body = JSON.stringify({ chat_id: cfg.telegram.chatId, text, parse_mode: 'HTML' });
     const req = https.request({
       hostname: 'api.telegram.org',
-      path:     `/bot${cfg.token}/sendMessage`,
+      path:     `/bot${cfg.telegram.token}/sendMessage`,
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, (res) => {
@@ -55,21 +48,41 @@ function sendMessage(text) {
 }
 
 function sendFeishu(text) {
-  if (!cfg.webhook) return Promise.resolve();
+  if (!isFeishuConfigured()) return Promise.resolve();
   return new Promise((resolve) => {
-    const body = JSON.stringify({ msg_type: 'text', content: { text: `V2EX｜${text}` } });
-    const u = new URL(cfg.webhook);
+    let target;
+    try {
+      target = new URL(cfg.feishu.webhook);
+    } catch (_) {
+      resolve();
+      return;
+    }
+
+    const body = JSON.stringify({
+      msg_type: 'text',
+      content: { text: `V2EX | ${stripHtml(text)}` },
+    });
     const req = https.request({
-      hostname: u.hostname,
-      path: u.pathname + u.search,
+      hostname: target.hostname,
+      path: `${target.pathname}${target.search}`,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, (res) => { res.resume(); res.on('end', resolve); });
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      res.resume();
+      res.on('end', resolve);
+    });
     req.on('error', resolve);
     req.setTimeout(10000, () => req.destroy());
     req.write(body);
     req.end();
   });
+}
+
+function sendMessage(text) {
+  return Promise.all([sendTelegram(text), sendFeishu(text)]).then(() => undefined);
 }
 
 // ========== 预定义通知模板 ==========
@@ -88,11 +101,15 @@ async function notifyReaderDone(stats) {
 
 // 连续错误停止
 async function notifyReaderError(stats) {
+  const reason = stats.reason || '连续 3 次失败';
+  const hint = reason.includes('Cookie')
+    ? 'Cookie 已确认失效，请更新'
+    : '已跳过异常帖子，请查看日志确认网络/CF/重定向状态';
   await sendMessage(
     `⚠️ <b>V2EX 阅读中止</b>\n` +
-    `❌ 连续 3 次失败，已停止\n` +
+    `❌ ${reason}\n` +
     `📖 已读: ${stats.read} 篇\n` +
-    `💡 Cookie 可能已失效，请更新`
+    `💡 ${hint}`
   );
 }
 

@@ -1,21 +1,39 @@
 # V2EX Max Helper 配置示例
 # 复制并编辑: cp .v2ex_env.example ~/.v2ex_env
 
-# ===== 飞书 L1：Webhook 推送通知（简单，推荐）=====
-# 飞书群 → 设置 → 群机器人 → 自定义机器人 → Webhook 地址
-# 安全设置选「自定义关键词」，填：V2EX
-FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/你的webhook地址
+# ===== Telegram 推送 / Bot (硬锁授权，唯一用户) =====
+# 向 @BotFather 申请的 Bot Token
+TG_TOKEN=<在此填入你的BotToken>
+# 方式 A：直接填写你的 Telegram 数字 Chat ID（向 @userinfobot 发消息可获取）
+# TG_CHAT_ID=<在此填入你的Chat_ID>
+# 方式 B：留空 TG_CHAT_ID 时必须设置绑定口令，首次私聊 Bot 发送 /bind <口令>
+# TG_SETUP_CODE=<自定义一次性绑定口令>
 
-# ===== 飞书 L2：应用机器人交互命令（可选，需额外配置）=====
-# 详见 docs/飞书应用机器人配置.md
-# FEISHU_APP_ID=cli_xxxxxxxxxxxx
-# FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxx
-# FEISHU_VERIFICATION_TOKEN=xxxxxxxxxxxxxxxx
-# FEISHU_BOT_PORT=6700
+# ===== Bark 推送（可选，仅签到脚本支持）=====
+# BARK_URL=https://api.day.app/你的KEY
 
-# ===== Telegram Bot（可选，传统方式）=====
-# TG_TOKEN=<BotToken>
-# TG_CHAT_ID=<ChatID>
-
-# ===== 阅读日志路径 =====
+# ===== 阅读日志路径（可选）=====
 # READER_LOG=/var/log/v2ex-reader.log
+
+# ===== 多账号串行（可选）=====
+# 最多读取前 6 个 profile；Telegram 面板“时段分块”可查看并手动启动
+# V2EX_PROFILE_LIST=acc1,acc2
+# PROFILE_TIME_SLOT_HOURS=4
+
+# ===== 代理（可选，默认关闭）=====
+# 代理软件不限定 mihomo，也可以是 xray-core、sing-box、Clash、Surge、gost 等
+# HTTP(S) 可带账号密码；Playwright 浏览器仅支持无认证 SOCKS5
+# V2EX_PROXY_ENABLE=1
+# V2EX_PROXY_ALLOW_LAN=1
+# V2EX_PROXY=http://127.0.0.1:7890
+# V2EX_PROXY=socks5://127.0.0.1:7890
+
+# ===== 飞书（实验/社区讨论，默认关闭）=====
+# FEISHU_ENABLE=1
+# FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/你的KEY
+# FEISHU_BOT_ENABLE=1
+# FEISHU_APP_ID=<飞书应用App ID>
+# FEISHU_APP_SECRET=<飞书应用App Secret>
+# FEISHU_VERIFICATION_TOKEN=<飞书事件订阅校验token>
+# FEISHU_CHAT_ID=<唯一授权飞书会话ID>
+# FEISHU_BOT_PORT=6700
