@@ -40,3 +40,4 @@ TG_TOKEN=<在此填入你的BotToken>
 # FEISHU_VERIFICATION_TOKEN=<飞书事件订阅校验token>
 # FEISHU_CHAT_ID=<唯一授权飞书会话ID>
 # FEISHU_BOT_PORT=6700
+# FEISHU_BOT_HOST=127.0.0.1   # 默认仅本机；公网直连回调需设 0.0.0.0

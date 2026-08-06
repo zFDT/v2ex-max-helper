@@ -444,9 +444,13 @@ function main() {
   }
   const port = Number(rawPort);
 
+  // 默认仅监听本机（安全）；需要公网直连回调时设置 FEISHU_BOT_HOST=0.0.0.0
+  const host = String(process.env.FEISHU_BOT_HOST || '127.0.0.1').trim() || '127.0.0.1';
+
   const server = createServer();
-  server.listen(port, '127.0.0.1', () => {
-    console.log(`[feishu-bot] listening on 127.0.0.1:${port} for private chat ${maskId(cfg.feishu.chatId)} (callback path: /feishu/callback; expose only through HTTPS reverse proxy)`);
+  server.listen(port, host, () => {
+    const bind = host === '0.0.0.0' || host === '::' ? '0.0.0.0' : host;
+    console.log(`[feishu-bot] listening on ${bind}:${port} for private chat ${maskId(cfg.feishu.chatId)} (callback path: /feishu/callback${host === '127.0.0.1' ? '; expose only through HTTPS reverse proxy' : ''})`);
   });
 }
 
