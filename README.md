@@ -3,8 +3,8 @@
 > V2EX 一站式自动助手：**每日签到** + **自动阅读刷活跃度** + **Telegram Bot 上报/远程控制**。
 
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
-![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.3.5-blue)
+![Node.js](https://img.shields.io/badge/Node.js-24%2B-339933?logo=node.js&logoColor=white)
+![Version](https://img.shields.io/badge/version-v1.4.11-blue)
 
 纯 Node.js 实现，可部署在任意 VPS、Docker 或 Render 上挂机运行。包含两个相互独立、可单独使用的模块：
 
@@ -37,8 +37,8 @@ V2EX 每天会根据用户的**浏览行为**自动发放铜币奖励（通常�
 - 🛑 **多重停止条件**：余额变化达标且满足最低阅读量 / 阅读量上限 / 超时窗口 / 登录确认失效，任一触发即安全退出。
 - 🤖 **Telegram Bot**：`/start` 控制面板、`/sou` 查余额、`/checkin`/`/read` 手动任务、`/cookie` 导入登录态、`/debug` 管日志、`/stop` 远程停止。
 - 📢 **推送告警**：Cookie 失效、活跃度奖励、阅读完成均可推送至 Telegram / Bark。
-- 👥 **多账号 + 指纹隔离**：通过 `V2EX_PROFILE` 隔离多账号的 Cookie、浏览器数据与**确定性指纹**（UA/视口/时区/语言/硬件/WebGL），降低账号关联风险。详见 [`docs/多账号与指纹隔离.md`](docs/多账号与指纹隔离.md)。
-- 🔒 **隐私优先**：所有 Token、Chat ID、Cookie 均从环境变量或运行时文件读取，**不写入代码**；未配置 `TG_CHAT_ID` 时必须设置 `TG_SETUP_CODE` 后才能首次绑定。
+- 👥 **多账号 + 凭证隔离**：通过 `V2EX_PROFILE` 隔离 Cookie、账号身份、浏览器数据、余额状态、阅读队列与确定性行为参数；Cookie 会先验证账号再原子替换，不会与其他账号的旧字段混合。详见 [`docs/多账号与指纹隔离.md`](docs/多账号与指纹隔离.md)。
+- 🔒 **隐私优先**：所有 Token、Chat ID、Cookie 均从环境变量或运行时文件读取，**不写入代码**；Telegram Bot 识别有效 Cookie 后会立即尝试删除原消息；未配置 `TG_CHAT_ID` 时必须设置 `TG_SETUP_CODE` 后才能首次绑定。
 
 ---
 
@@ -48,7 +48,7 @@ V2EX 每天会根据用户的**浏览行为**自动发放铜币奖励（通常�
 
 **签到链路**
 
-默认每日按运行环境的本机时间 `09:10` 触发；Docker / Render 可通过 `TZ` 指定时区。
+默认每日按运行环境的本机时间 `09:10` 起触发；当日完成状态会落盘，Bot 在错过精确分钟或重启后可补跑。Docker / Render 可通过 `TZ` 指定时区。
 
 1. 读取本地 Cookie。
 2. 访问每日任务页，判断今天是否已经签到。
@@ -66,7 +66,7 @@ V2EX 每天会根据用户的**浏览行为**自动发放铜币奖励（通常�
 
 **自动阅读链路**
 
-默认每日按运行环境的本机时间 `09:15` 触发；默认截止时间为本机时间 `14:00`。
+默认每日按运行环境的本机时间 `09:15` 起触发并落盘去重；默认截止时间为本机时间 `14:00`。
 
 1. 启动 Playwright，并注入当前 profile 的指纹和 Cookie。
 2. 从 SQLite 队列取帖子，队列来源包括 `/recent`、热门、全部、技术分区等页面。
@@ -96,7 +96,7 @@ Bot 作为常驻进程运行，负责远程控制和状态查询。
 
 提供 Docker / Render / VPS 脚本等部署方式，任选其一。
 
-**前置**：运行环境需要能访问 `www.v2ex.com`。VPS 脚本部署需要 Linux（Debian/Ubuntu 最省心）+ Node.js 18+；Docker / Render 会在镜像内安装依赖。
+**前置**：运行环境需要能访问 `www.v2ex.com`。VPS 脚本部署需要 Linux（Debian/Ubuntu 最省心）+ Node.js 24+；Docker / Render 会在镜像内安装依赖。
 
 | 使用场景 | 内存 | Swap | 说明 |
 |----------|------|------|------|
@@ -104,9 +104,9 @@ Bot 作为常驻进程运行，负责远程控制和状态查询。
 | **签到 + 自动阅读** | **512 MB** | **建议 1 GB** | Chromium 峰值约 400~700 MB，**务必配 Swap** |
 | **签到 + 自动阅读（推荐）** | **2 GB** | 可不开 | 运行稳定 |
 
-代理默认关闭。确实需要时设置 `V2EX_PROXY_ENABLE=1`，并指定本机代理，例如 `V2EX_PROXY=http://127.0.0.1:7890` 或 `V2EX_PROXY=socks5://127.0.0.1:7890`。代理服务不限定 mihomo，也可以是 xray-core、sing-box、Clash、Surge、gost 等；如果代理在局域网另一台机器上，需要额外设置 `V2EX_PROXY_ALLOW_LAN=1`，项目仍拒绝公网代理。
+代理默认关闭。确实需要时设置 `V2EX_PROXY_ENABLE=1`：原生部署可用 `V2EX_PROXY=http://127.0.0.1:7890`，Docker Compose 连接宿主机 mihomo / sing-box 等代理时使用 `V2EX_PROXY=http://host.docker.internal:7890`。未设置 `V2EX_PROXY` 时会依次读取 `https_proxy` / `HTTPS_PROXY`、`http_proxy` / `HTTP_PROXY`、`all_proxy` / `ALL_PROXY`；显式 `V2EX_PROXY` 始终优先。项目的 Node.js HTTPS 请求与 Chromium 共用该代理，启用后若配置校验失败会拒绝启动，不静默回退；`NO_PROXY` 只允许本机、Docker 别名和私网目标绕过，V2EX 公网请求仍强制走代理。局域网代理仍需额外设置 `V2EX_PROXY_ALLOW_LAN=1`，公网代理继续拒绝。
 
-多账号串行阅读可通过 `V2EX_PROFILE_LIST=acc1,acc2` 开启，最多读取前 6 个 profile；未配置时保持单账号行为。Telegram 面板中的“时段分块”可查看窗口并手动启动串行签到 + 阅读。飞书通知 / 交互 Bot 属于社区讨论阶段能力，默认关闭，如需调整功能或部署方式，欢迎提交 issue 或 PR。
+多账号串行阅读可通过 `V2EX_PROFILE_LIST=default,1,2` 开启，最多读取前 6 个 profile；每个 profile 是一个固定账号位置，名称仅允许字母、数字、下划线和连字符，且不得只靠大小写区分或使用 Windows 设备保留名。每个固定时段包含该位置账号的签到和阅读，全部时段总长不得超过 24 小时。Telegram `/start` 面板会显示当前操作位置和脱敏用户名；“切换账号”中空位置可直接导入 Cookie，签到、余额及 5/10/50/250 篇阅读默认作用于当前账号。多账号 CLI 未明确指定 `V2EX_PROFILE` 时仍会拒绝运行。飞书通知 / 交互 Bot 属于社区讨论阶段能力，默认关闭。
 
 ---
 
@@ -121,11 +121,13 @@ docker compose up -d --build
 docker compose logs -f v2ex-bot
 ```
 
-如果没有在 `.env` 里填写 `TG_CHAT_ID`，必须设置 `TG_SETUP_CODE`，容器启动后私聊 Bot 发送 `/bind <口令>` 完成绑定；无口令首次自动绑定已关闭，避免被陌生人抢先绑定。随后直接粘贴完整 V2EX Cookie，Bot 会自动识别、验证并写入持久化数据卷。
+Compose 默认使用 `Asia/Shanghai`，可在 `.env` 中设置 `TZ=Asia/Taipei`、`America/New_York` 等 IANA 时区覆盖；签到、阅读和截止窗口都按容器本机时间计算。
 
-运行数据保存在 `v2ex-data` volume 中；脚本刷新后的 Cookie 会优先沿用 volume 里的版本，避免容器重启时被旧环境变量覆盖。
+如果没有在 `.env` 里填写 `TG_CHAT_ID`，必须设置 `TG_SETUP_CODE`，容器启动后私聊 Bot 发送 `/bind <口令>` 完成绑定；无口令首次自动绑定已关闭。随后直接粘贴完整 V2EX Cookie，Bot 会验证真实账号后再写入目标 profile；账号变化时必须显式确认换绑。
 
-仓库还包含 GitHub Actions 镜像发布流程：推送到 `mskatoni-patch-beta`、`main` 或 `master` 时会构建并发布到 GHCR。
+运行数据保存在 `v2ex-data` volume 中；已有 Cookie 不会被环境变量覆盖。多账号使用 `V2EX_COOKIE` 启动时还必须显式设置列表内的 `V2EX_PROFILE`，否则该启动凭证会被忽略。
+
+仓库还包含 GitHub Actions 镜像发布流程：测试通过后，`mskatoni-patch-beta` 发布 `:beta`，只有 `main` 发布 `:latest`；版本标签和各次构建同时保留对应 tag / commit SHA 镜像，避免旧标签回滚 `latest`。
 
 ---
 
@@ -138,9 +140,11 @@ docker compose logs -f v2ex-bot
 ```text
 V2EX_COOKIE=完整 V2EX Cookie
 TG_TOKEN=BotFather 申请的 Bot Token
-TG_CHAT_ID=你的 Telegram 数字 Chat ID（与 TG_SETUP_CODE 二选一）
-TG_SETUP_CODE=首次私聊绑定口令（未填 TG_CHAT_ID 时必填）
+TG_CHAT_ID=你的 Telegram 数字 Chat ID（Render 推荐，重启后仍有效）
+TG_SETUP_CODE=临时首次绑定口令（仅在未填 TG_CHAT_ID 时使用）
 ```
+
+`TG_CHAT_ID` 的真实值只应填写在 Render Dashboard 的 Environment 中，不要写入 `render.yaml`、README、提交记录或其他公开文件。Render 免费实例没有持久磁盘时，`/bind` 产生的 `.telegram_chat_id` 只保存在临时文件系统；实例休眠、重启或重新部署后会丢失，并再次要求绑定。因此 Render 部署应优先固定配置 `TG_CHAT_ID`，确认生效后可移除 `TG_SETUP_CODE`。
 
 健康检查路径为 `/health`。如果只想运行签到和 Bot，不跑自动阅读，可额外设置：
 
@@ -148,9 +152,9 @@ TG_SETUP_CODE=首次私聊绑定口令（未填 TG_CHAT_ID 时必填）
 SKIP_READER=1
 ```
 
-Render 免费实例可能休眠，Bot 内置自保活逻辑会在配置 `RENDER_EXTERNAL_URL` 时定期访问自身；同时建议使用 [UptimeRobot](https://uptimerobot.com/) 这类外部监控服务对 Render 服务 URL 做 HTTP 保活。稳定性要求更高时建议使用付费实例。
+Render 免费实例可能休眠，Bot 内置自保活逻辑会在配置 `RENDER_EXTERNAL_URL` 时定期访问自身；同时建议使用 [UptimeRobot](https://uptimerobot.com/) 这类外部监控服务对 Render 服务 URL 做 HTTP 保活。保活只能减少休眠，不能保证临时文件持久化；稳定性要求更高时建议使用付费实例。
 
-Render Blueprint 默认把运行时数据写到 `/app/data`。免费实例文件系统不保证长期持久，重建后建议重新私聊绑定 Bot 或重新粘贴 Cookie；需要强持久化时可改用 Docker/VPS，或在付费实例上挂载 Render Disk。
+Render Blueprint 默认把运行时数据写到 `/app/data`。[Render 免费实例](https://render.com/docs/free)的文件系统不保证长期持久，重建后运行时绑定文件、Bot 内导入的 Cookie 和队列状态都可能丢失；固定授权请使用 Dashboard 中的 `TG_CHAT_ID`，启动 Cookie 可使用 Dashboard 中的 `V2EX_COOKIE`。需要完整持久化时可改用 Docker/VPS，或在付费实例上挂载 Render Disk。
 
 ---
 
@@ -168,13 +172,14 @@ Render Blueprint 默认把运行时数据写到 `/app/data`。免费实例文件
 
 ### 方式四：一键部署脚本
 
-在 Linux VPS 上以 **root** 执行，自动完成 8 个步骤：装 Node.js → 拉取项目 → 装依赖（含 Chromium/xvfb）→ 引导粘贴 Cookie → 配好 systemd 定时任务 → 可选安装 Bot → 输出组件状态摘要。
+在 Linux VPS 上以 **root** 执行，自动完成 8 个步骤：装 Node.js → 拉取项目 → 装依赖（含 Chromium）→ 引导粘贴 Cookie → 配好 systemd 定时任务 → 可选安装 Bot → 输出组件状态摘要。浏览器默认 headless，systemd 不启用 `xvfb-run`；只有显式设置 `HEADLESS=false` 时才需要选择 xvfb 包装。Playwright 的官方系统依赖安装器可能仍会安装 xvfb 兼容包，但空闲时不会启动它。
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/mskatoni/v2ex-max-helper/mskatoni-patch-beta/scripts/install.sh)
 ```
 
 > 用 `bash <(curl ...)` 而非 `curl | bash`，这样脚本才能正常接收你的**交互输入**（粘贴 Cookie、选择是否装阅读模块和 Bot）。
+> 该地址跟随 beta 分支；高安全要求的机器应先下载并审阅脚本，或改用已核验的 release / commit 地址后再以 root 执行。
 
 可选环境变量（写在命令前面即可）：
 
@@ -220,7 +225,7 @@ node main.js --dry-run
 node main.js --limit 5
 
 # 余额调试：打印 /balance 请求状态、诊断结果与解析片段
-node inspect_balance.js
+node inspect_balance.js                 # 仅输出脱敏结构摘要
 ```
 
 | 参数 | 说明 |
@@ -238,22 +243,25 @@ node inspect_balance.js
 |------|------|
 | `/start` | 打开交互遥控中心（含内联按钮） |
 | `/help` | 查看命令帮助 |
-| `/sou` | 查询今日 / 昨日余额（铜币）记录 |
-| `/tasks` | 查看当前后台任务状态 |
+| `/sou` | 查询今日 / 昨日余额（铜币）记录；兼容 `/balance` |
+| `/tasks` | 查看当前后台任务状态；兼容 `/status`、`/stats` |
 | `/checkin` | 立即运行一次签到 |
-| `/read [数量]` | 手动触发阅读，默认 5 篇 |
-| `/cookie [内容]` | 导入并合并 V2EX Cookie；也可以直接粘贴 Cookie 文本 |
+| `/read [数量]` | 打开 5/10/50/250 篇选择；也可直接指定其中一档 |
+| `/cookie [profile] [内容]` | 验证账号后原子替换该 profile 的 Cookie；也可以直接粘贴 Cookie 文本 |
 | `/debug [OFF\|ERROR\|WARN\|INFO]` | 查看或修改日志级别，默认 `OFF` |
-| `/stop` | 远程停止正在运行的阅读脚本 |
+| `/stop [profile]` | 停止当前任务；串行运行时同时取消后续账号，指定 profile 可避免误停其他账号 |
+| `/bind <口令>` | 首次绑定授权用户；已配置 `TG_CHAT_ID` 或已完成绑定后无需重复执行 |
 
 Bot 通过 `TG_CHAT_ID` 或首次私聊绑定文件 **硬锁授权**，只响应你本人的消息，其他人无法控制。为减少隐私暴露，`TG_CHAT_ID` 可以不填，但此时必须设置 `TG_SETUP_CODE`；首次绑定时发送 `/bind <口令>`，Bot 才会把 Chat ID 写入运行时数据目录。无口令首次自动绑定已关闭。
+
+Bot 启动后会为授权私聊刷新 Telegram 命令菜单并清理旧作用域中的过期命令；历史消息里的旧操作按钮不会直接执行有副作用的任务，请重新发送 `/start` 获取当前面板。
 
 ### 安装 Bot
 
 Bot 是常驻进程。**一键部署脚本**在 Step 7/8 会交互式询问是否安装；也可事后手动安装：
 
 ```bash
-sudo bash scripts/install-systemd.sh --bot   # 安装 Bot 常驻 service
+sudo bash scripts/install-systemd.sh --bot-only  # 只安装 Bot 常驻 service，不重写已有 timers
 systemctl status v2ex-bot                     # 查看状态
 ```
 
@@ -267,19 +275,19 @@ systemctl status v2ex-bot                     # 查看状态
 ```
 v2ex-max-helper/
 ├── checkin/                 # 签到模块
-│   ├── v2ex-checkin.js      # 签到 + 保活主程序（v1.3.5）
+│   ├── v2ex-checkin.js      # 签到 + 保活主程序（v1.4.11）
 │   └── package.json
 ├── reader/                  # 自动阅读 + Bot 模块
 │   ├── main.js              # 阅读主调度器（支持 --dry-run / --limit）
 │   ├── bot.js               # Telegram Bot 命令处理器（常驻进程）
-│   ├── notify.js            # 推送通知（Telegram / Bark）
+│   ├── notify.js            # 推送通知（Telegram / Bark / 飞书）
 │   ├── browser.js           # Playwright 浏览器控制 + 拟人随机化
 │   ├── fetcher.js           # 帖子 URL 多源抓取（/recent 多页 + 分区）
 │   ├── balance.js           # 余额监控 + 变化检测 + 失败诊断
 │   ├── queue.js             # SQLite 去重队列（每帖最多读 3 次）
 │   ├── fingerprint.js       # 浏览器指纹隔离（多账号确定性指纹）
 │   ├── logger.js            # 日志
-│   ├── inspect_balance.js   # 余额调试工具（手动排查用）
+│   ├── inspect_balance.js   # 余额调试工具（仅输出脱敏结构摘要）
 │   ├── data/                # 运行时数据（已被 gitignore）
 │   └── package.json
 ├── scripts/                 # 运维脚本
@@ -287,8 +295,8 @@ v2ex-max-helper/
 │   ├── install-systemd.sh   # systemd timer + Bot + logrotate 安装
 │   ├── entrypoint.sh        # Docker / Render 容器入口
 │   └── keepalive-setup.md   # Render / 外部保活说明
-├── docker/                  # 旧版 cron 容器部署参考
-├── lib/                     # checkin / reader 共用配置模块
+├── lib/                     # 共用配置、代理、身份、锁与串行时段模块
+├── test/                    # 本地安全、隔离与持久化回归测试
 ├── .github/workflows/       # GHCR 镜像构建发布
 ├── docs/                    # 中文文档
 │   ├── 部署指南.md          # 手动部署完整流程
@@ -301,7 +309,7 @@ v2ex-max-helper/
 ├── Dockerfile               # Docker / Render 镜像构建
 ├── docker-compose.yml       # Docker Compose 部署
 ├── render.yaml              # Render Blueprint
-├── server.js                # 健康检查 HTTP 服务
+├── server.js                # 可独立运行的最小健康检查服务（容器默认复用 Bot 内置服务）
 ├── .gitignore
 ├── LICENSE
 └── README.md
@@ -326,7 +334,7 @@ bash ~/v2ex-max-helper/scripts/install.sh --update
 ```bash
 cd ~/v2ex-max-helper
 git pull origin mskatoni-patch-beta           # git clone 安装 beta 分支的
-cd reader && npm install                      # 更新依赖
+cd reader && npm ci                           # 按 lockfile 更新依赖
 ```
 
 > 更新不会影响你的 `~/.v2ex_cookie`、`~/.v2ex_env`、`reader/data/` 等运行时数据。

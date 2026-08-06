@@ -4,6 +4,8 @@ const https  = require('https');
 const config = require('../lib/config');
 
 const cfg = config.getConfig();
+const PUSH_RETRY_COUNT = 3;
+const PUSH_RETRY_BASE_MS = 100;
 
 function isTelegramConfigured() {
   // 未配置 Token / Chat ID 时静默跳过推送，不影响主流程
@@ -27,9 +29,66 @@ function stripHtml(text) {
     .replace(/&amp;/g, '&');
 }
 
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function withProfile(text) {
+  if (cfg.profile === 'default') return text;
+  return `👤 <b>Profile</b>: <code>${escapeHtml(cfg.profile)}</code>\n${text}`;
+}
+
+function warnPushFailure(channel, detail) {
+  console.warn(`[notify] ${channel} 推送失败: ${detail}`);
+}
+
+function isSuccessStatus(statusCode) {
+  return Number.isInteger(statusCode) && statusCode >= 200 && statusCode < 300;
+}
+
+function isRetryableStatus(statusCode) {
+  return statusCode === 408 || statusCode === 425 || statusCode === 429 || statusCode >= 500;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function sendWithRetries(channel, operation) {
+  for (let attempt = 0; attempt <= PUSH_RETRY_COUNT; attempt++) {
+    let result;
+    try {
+      result = await operation();
+    } catch (_) {
+      result = { ok: false, retryable: true, detail: 'network error' };
+    }
+    if (result.ok) return;
+    if (!result.retryable || attempt === PUSH_RETRY_COUNT) {
+      warnPushFailure(channel, result.detail);
+      return;
+    }
+    const delay = PUSH_RETRY_BASE_MS * (2 ** attempt);
+    warnPushFailure(channel, `${result.detail}; retry ${attempt + 1}/${PUSH_RETRY_COUNT}`);
+    await sleep(delay);
+  }
+}
+
 function sendTelegram(text) {
   if (!isTelegramConfigured()) return Promise.resolve();
+  return sendWithRetries('Telegram', () => sendTelegramOnce(text));
+}
+
+function sendTelegramOnce(text) {
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     const body = JSON.stringify({ chat_id: cfg.telegram.chatId, text, parse_mode: 'HTML' });
     const req = https.request({
       hostname: 'api.telegram.org',
@@ -37,11 +96,56 @@ function sendTelegram(text) {
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, (res) => {
-      res.resume();
-      res.on('end', resolve);
+      let data = '';
+      let received = 0;
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        if (settled) return;
+        received += Buffer.byteLength(chunk);
+        if (received > 64 * 1024) {
+          finish({ ok: false, retryable: true, detail: 'response too large' });
+          req.destroy();
+          return;
+        }
+        data += chunk;
+      });
+      res.on('aborted', () => {
+        finish({ ok: false, retryable: true, detail: 'response aborted' });
+      });
+      res.on('error', () => {
+        finish({ ok: false, retryable: true, detail: 'response error' });
+      });
+      res.on('end', () => {
+        if (settled) return;
+        if (!isSuccessStatus(res.statusCode)) {
+          finish({
+            ok: false,
+            retryable: isRetryableStatus(res.statusCode),
+            detail: `HTTP ${res.statusCode || 'unknown'}`,
+          });
+          return;
+        }
+        try {
+          if (!JSON.parse(data || '{}').ok) {
+            finish({ ok: false, retryable: false, detail: 'API rejected request' });
+            return;
+          }
+        } catch (_) {
+          finish({ ok: false, retryable: true, detail: 'invalid API response' });
+          return;
+        }
+        finish({ ok: true, retryable: false, detail: '' });
+      });
     });
-    req.on('error', resolve); // 推送失败不影响主流程
-    req.setTimeout(10000, () => req.destroy());
+    req.on('error', () => {
+      if (settled) return;
+      finish({ ok: false, retryable: true, detail: 'network error' });
+    });
+    req.setTimeout(10000, () => {
+      if (settled) return;
+      finish({ ok: false, retryable: true, detail: 'timeout' });
+      req.destroy();
+    });
     req.write(body);
     req.end();
   });
@@ -49,21 +153,33 @@ function sendTelegram(text) {
 
 function sendFeishu(text) {
   if (!isFeishuConfigured()) return Promise.resolve();
+  return sendWithRetries('Feishu', () => sendFeishuOnce(text));
+}
+
+function sendFeishuOnce(text) {
   return new Promise((resolve) => {
     let target;
     try {
       target = new URL(cfg.feishu.webhook);
+      if (target.protocol !== 'https:' || target.username || target.password) throw new Error('unsafe URL');
     } catch (_) {
-      resolve();
+      resolve({ ok: false, retryable: false, detail: 'invalid webhook URL' });
       return;
     }
 
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     const body = JSON.stringify({
       msg_type: 'text',
       content: { text: `V2EX | ${stripHtml(text)}` },
     });
     const req = https.request({
       hostname: target.hostname,
+      port: target.port || 443,
       path: `${target.pathname}${target.search}`,
       method: 'POST',
       headers: {
@@ -71,18 +187,66 @@ function sendFeishu(text) {
         'Content-Length': Buffer.byteLength(body),
       },
     }, (res) => {
-      res.resume();
-      res.on('end', resolve);
+      let data = '';
+      let received = 0;
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        if (settled) return;
+        received += Buffer.byteLength(chunk);
+        if (received > 64 * 1024) {
+          finish({ ok: false, retryable: true, detail: 'response too large' });
+          req.destroy();
+          return;
+        }
+        data += chunk;
+      });
+      res.on('aborted', () => {
+        finish({ ok: false, retryable: true, detail: 'response aborted' });
+      });
+      res.on('error', () => {
+        finish({ ok: false, retryable: true, detail: 'response error' });
+      });
+      res.on('end', () => {
+        if (settled) return;
+        if (!isSuccessStatus(res.statusCode)) {
+          finish({
+            ok: false,
+            retryable: isRetryableStatus(res.statusCode),
+            detail: `HTTP ${res.statusCode || 'unknown'}`,
+          });
+          return;
+        }
+        try {
+          const parsed = JSON.parse(data);
+          const code = parsed.code !== undefined ? parsed.code : parsed.StatusCode;
+          if (code === undefined || Number(code) !== 0) {
+            finish({ ok: false, retryable: false, detail: 'API rejected request' });
+            return;
+          }
+        } catch (_) {
+          finish({ ok: false, retryable: true, detail: 'invalid API response' });
+          return;
+        }
+        finish({ ok: true, retryable: false, detail: '' });
+      });
     });
-    req.on('error', resolve);
-    req.setTimeout(10000, () => req.destroy());
+    req.on('error', () => {
+      if (settled) return;
+      finish({ ok: false, retryable: true, detail: 'network error' });
+    });
+    req.setTimeout(10000, () => {
+      if (settled) return;
+      finish({ ok: false, retryable: true, detail: 'timeout' });
+      req.destroy();
+    });
     req.write(body);
     req.end();
   });
 }
 
 function sendMessage(text) {
-  return Promise.all([sendTelegram(text), sendFeishu(text)]).then(() => undefined);
+  const profiledText = withProfile(text);
+  return Promise.all([sendTelegram(profiledText), sendFeishu(profiledText)]).then(() => undefined);
 }
 
 // ========== 预定义通知模板 ==========
@@ -92,10 +256,10 @@ async function notifyReaderDone(stats) {
   const emoji = stats.changed >= 2 ? '🎉' : '✅';
   await sendMessage(
     `${emoji} <b>V2EX 阅读完成</b>\n` +
-    `📖 阅读: ${stats.read} 篇\n` +
-    `💰 余额变化: ${stats.changed} 次\n` +
-    `⏱ 耗时: ${stats.elapsed}\n` +
-    `🛑 原因: ${stats.reason || '达到上限'}`
+    `📖 阅读: ${escapeHtml(stats.read)} 篇\n` +
+    `💰 余额变化: ${escapeHtml(stats.changed)} 次\n` +
+    `⏱ 耗时: ${escapeHtml(stats.elapsed)}\n` +
+    `🛑 原因: ${escapeHtml(stats.reason || '达到上限')}`
   );
 }
 
@@ -104,12 +268,12 @@ async function notifyReaderError(stats) {
   const reason = stats.reason || '连续 3 次失败';
   const hint = reason.includes('Cookie')
     ? 'Cookie 已确认失效，请更新'
-    : '已跳过异常帖子，请查看日志确认网络/CF/重定向状态';
+    : '已完成单帖和登录探针重试，请查看日志确认网络/CF/重定向状态';
   await sendMessage(
     `⚠️ <b>V2EX 阅读中止</b>\n` +
-    `❌ ${reason}\n` +
-    `📖 已读: ${stats.read} 篇\n` +
-    `💡 ${hint}`
+    `❌ ${escapeHtml(reason)}\n` +
+    `📖 已读: ${escapeHtml(stats.read)} 篇\n` +
+    `💡 ${escapeHtml(hint)}`
   );
 }
 
@@ -118,7 +282,7 @@ async function notifySessionExpired() {
   await sendMessage(
     `🔴 <b>V2EX Session 失效</b>\n` +
     `Cookie 已过期，请重新登录并更新 Cookie\n` +
-    `更新方式：将新 Cookie 写入服务器的 <code>~/.v2ex_cookie</code>`
+    `更新方式：通过 Telegram 面板为 profile <code>${escapeHtml(cfg.profile)}</code> 重新导入 Cookie`
   );
 }
 
@@ -126,8 +290,8 @@ async function notifySessionExpired() {
 async function notifyBalanceChanged(from, to, count) {
   await sendMessage(
     `💰 <b>V2EX 活跃度奖励</b>\n` +
-    `铜币: ${from} → ${to} (+${to - from})\n` +
-    `今日第 ${count} 次奖励`
+    `铜币: ${escapeHtml(from)} → ${escapeHtml(to)} (+${escapeHtml(to - from)})\n` +
+    `今日第 ${escapeHtml(count)} 次奖励`
   );
 }
 
@@ -136,7 +300,7 @@ async function notifyCheckin(result) {
   const ok = result.success;
   await sendMessage(
     `${ok ? '✅' : '❌'} <b>V2EX 签到${ok ? '成功' : '失败'}</b>\n` +
-    `${result.message || ''}`
+    `${escapeHtml(result.message || '')}`
   );
 }
 

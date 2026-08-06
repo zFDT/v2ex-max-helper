@@ -7,6 +7,7 @@ const fingerprint = require('./fingerprint');
 const behavior    = require('./behavior');
 const config      = require('../lib/config');
 const secureProxy = require('../lib/secure-proxy');
+const profileAuth = require('../lib/profile-auth');
 
 // ===== 多账号 / 指纹隔离 =====
 // 通过 V2EX_PROFILE（或默认 'default'）区分账号。每个 profile 拥有：
@@ -16,14 +17,36 @@ const secureProxy = require('../lib/secure-proxy');
 const cfg = config.getConfig();
 const PROFILE = cfg.profile;
 const HOST    = 'www.v2ex.com';
+const V2EX_ORIGIN = `https://${HOST}`;
 
 const COOKIE_FILE   = cfg.cookieFile;
 const USER_DATA_DIR = cfg.chromeProfileDir;
 
+const MIB = 1024 * 1024;
+const DISK_CACHE_LIMIT_BYTES = 64 * MIB;
+const MEDIA_CACHE_LIMIT_BYTES = 16 * MIB;
+const CACHE_PRUNE_THRESHOLD_BYTES = 128 * MIB;
+const READ_POST_RETRY_COUNT = 3;
+const READ_POST_RETRY_BASE_MS = 5000;
+const BROWSER_IO_RETRY_COUNT = 3;
+const BROWSER_IO_RETRY_BASE_MS = 1000;
+const CACHE_PATHS = [
+  path.join('Default', 'Cache'),
+  path.join('Default', 'Code Cache'),
+  path.join('Default', 'GPUCache'),
+  path.join('Default', 'DawnCache'),
+  path.join('Default', 'DawnGraphiteCache'),
+  path.join('Default', 'DawnWebGPUCache'),
+  path.join('Default', 'Service Worker', 'CacheStorage'),
+  'GrShaderCache',
+  'GraphiteDawnCache',
+  'ShaderCache',
+];
+
 // 为当前 profile 生成确定性指纹
 const FP = fingerprint.generate(PROFILE);
 const BEHAVIOR = behavior.resolve(PROFILE);
-const HTTP_ONLY_COOKIES = new Set(['A2', 'PB3_SESSION', 'cf_clearance']);
+const HTTP_ONLY_COOKIES = new Set(['A2', 'A2O', 'PB3_SESSION', 'cf_clearance']);
 
 // Cookie 字符串 → Playwright cookies 数组
 function parseCookieString(str) {
@@ -46,15 +69,121 @@ function parseCookieString(str) {
 
 // Playwright cookies 数组 → Cookie 字符串（写回文件）
 function serializeCookies(cookies) {
-  return cookies
-    .filter(c => c.domain && c.domain.includes('v2ex'))
-    .map(c => `${c.name}=${c.value}`)
-    .join('; ');
+  const selected = new Map();
+  for (const cookie of cookies) {
+    const domain = String(cookie.domain || '').replace(/^\./, '').toLowerCase();
+    if ((domain !== HOST && domain !== 'v2ex.com') || String(cookie.path || '/') !== '/') continue;
+    const rank = domain === HOST ? 2 : 1;
+    const existing = selected.get(cookie.name);
+    if (!existing || rank >= existing.rank) selected.set(cookie.name, { cookie, rank });
+  }
+  return Array.from(selected.values()).map(({ cookie }) => `${cookie.name}=${cookie.value}`).join('; ');
+}
+
+function normalizePostUrl(value) {
+  let parsed;
+  try { parsed = new URL(value); } catch (_) { throw new Error('帖子 URL 格式无效'); }
+  if (parsed.username || parsed.password || parsed.origin !== V2EX_ORIGIN || !/^\/t\/\d+$/.test(parsed.pathname)) {
+    throw new Error('拒绝访问非 V2EX 帖子 URL');
+  }
+  parsed.hash = '';
+  parsed.search = '';
+  return parsed;
+}
+
+function isV2exOrigin(value) {
+  try { return new URL(value).origin === V2EX_ORIGIN; } catch (_) { return false; }
 }
 
 let ctx      = null;   // BrowserContext（persistent context）
 let page     = null;
 let isDryRun = false;
+
+function buildLaunchArgs() {
+  const args = [
+    '--disable-blink-features=AutomationControlled',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    `--disk-cache-size=${DISK_CACHE_LIMIT_BYTES}`,
+    `--media-cache-size=${MEDIA_CACHE_LIMIT_BYTES}`,
+    '--js-flags=--max-old-space-size=256',
+    '--disable-extensions',
+    '--disable-default-apps',
+    `--lang=${FP.locale}`,
+  ];
+  if (secureProxy.proxyEnabled()) args.push('--disable-quic');
+  return args;
+}
+
+function cachePathSize(target) {
+  let stat;
+  try {
+    stat = fs.lstatSync(target);
+  } catch (_) {
+    return 0;
+  }
+  if (stat.isSymbolicLink()) return 0;
+  if (stat.isFile()) return stat.size;
+  if (!stat.isDirectory()) return 0;
+
+  let total = 0;
+  for (const entry of fs.readdirSync(target)) {
+    total += cachePathSize(path.join(target, entry));
+  }
+  return total;
+}
+
+function getCacheTargets(profileDir) {
+  const root = path.resolve(profileDir);
+  return CACHE_PATHS.map(relativePath => {
+    const target = path.resolve(root, relativePath);
+    const relative = path.relative(root, target);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new Error('拒绝清理不安全的 Chromium 缓存路径');
+    }
+    return target;
+  });
+}
+
+function pruneBrowserCache(profileDir = USER_DATA_DIR, thresholdBytes = CACHE_PRUNE_THRESHOLD_BYTES) {
+  if (!Number.isSafeInteger(thresholdBytes) || thresholdBytes < 0) {
+    throw new Error('Chromium 缓存清理阈值无效');
+  }
+  const targets = getCacheTargets(profileDir);
+  const sizeBefore = targets.reduce((sum, target) => sum + cachePathSize(target), 0);
+  if (sizeBefore <= thresholdBytes) {
+    return { pruned: false, sizeBefore, sizeAfter: sizeBefore, failed: 0 };
+  }
+
+  let failed = 0;
+  for (const target of targets) {
+    try {
+      const stat = fs.lstatSync(target);
+      if (stat.isSymbolicLink()) continue;
+      fs.rmSync(target, { recursive: true, force: true });
+    } catch (e) {
+      if (e.code !== 'ENOENT') failed++;
+    }
+  }
+  const sizeAfter = targets.reduce((sum, target) => sum + cachePathSize(target), 0);
+  return { pruned: true, sizeBefore, sizeAfter, failed };
+}
+
+function pruneBrowserCacheWithLog() {
+  try {
+    const result = pruneBrowserCache();
+    if (!result.pruned) return;
+    const beforeMiB = (result.sizeBefore / MIB).toFixed(1);
+    const afterMiB = (result.sizeAfter / MIB).toFixed(1);
+    logger.info(`Chromium 缓存已按阈值裁剪: ${beforeMiB} MiB -> ${afterMiB} MiB`);
+    if (result.failed > 0) logger.warn(`Chromium 缓存有 ${result.failed} 个目录清理失败`);
+  } catch (e) {
+    logger.warn(`Chromium 缓存检查失败: ${e.message}`);
+  }
+}
 
 async function launch(dryRun = false) {
   isDryRun = dryRun;
@@ -72,74 +201,69 @@ async function launch(dryRun = false) {
     throw new Error(`Cookie 文件不存在或为空: ${COOKIE_FILE}`);
   }
 
-  const { chromium } = require('playwright');
+  try {
+    const { chromium } = require('playwright');
 
-  // 确保 Chrome profile 目录存在
-  fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    // 确保 Chrome profile 目录存在
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    pruneBrowserCacheWithLog();
 
-  logger.info('浏览器启动中...');
-  logger.info('浏览器指纹已按当前 profile 注入');
-  logger.info(`行为参数 profile=${PROFILE} dwell=${BEHAVIOR.dwellMin}-${BEHAVIOR.dwellMax}/${BEHAVIOR.dwellLong}ms gap=${BEHAVIOR.humanGapMin}-${BEHAVIOR.humanGapMax}ms settle=${BEHAVIOR.memorySettleMs}ms`);
-  if (BEHAVIOR.usesLegacyGap) {
-    logger.warn('检测到 READ_GAP_MIN/MAX 旧变量，已作为 READ_HUMAN_GAP_MIN/MAX 兼容处理');
+    logger.info('浏览器启动中...');
+    logger.info('浏览器指纹已按当前 profile 注入');
+    logger.info(`行为参数 profile=${PROFILE} dwell=${BEHAVIOR.dwellMin}-${BEHAVIOR.dwellMax}/${BEHAVIOR.dwellLong}ms gap=${BEHAVIOR.humanGapMin}-${BEHAVIOR.humanGapMax}ms settle=${BEHAVIOR.memorySettleMs}ms`);
+    if (BEHAVIOR.usesLegacyGap) {
+      logger.warn('检测到 READ_GAP_MIN/MAX 旧变量，已作为 READ_HUMAN_GAP_MIN/MAX 兼容处理');
+    }
+
+    const launchOptions = {
+      executablePath: process.env.CHROME_BIN || undefined,
+      headless: process.env.HEADLESS !== 'false',
+      args: buildLaunchArgs(),
+      ignoreHTTPSErrors: false,
+      userAgent:  FP.userAgent,
+      locale:     FP.locale,
+      timezoneId: FP.timezoneId,
+      viewport:   FP.viewport,
+      deviceScaleFactor: 1,
+      extraHTTPHeaders: {
+        'Accept-Language': FP.acceptLanguage,
+      },
+    };
+
+    const proxy = secureProxy.getPlaywrightProxy();
+    if (proxy) {
+      launchOptions.proxy = proxy;
+      logger.info(`浏览器启用本机代理: ${secureProxy.redactProxyUrl(proxy.server)}`);
+    }
+
+    ctx = await chromium.launchPersistentContext(USER_DATA_DIR, launchOptions);
+
+    // 注入指纹隔离脚本（webdriver 隐藏 + navigator/WebGL 伪装）
+    await ctx.addInitScript(fingerprint.buildInitScript(FP), {
+      navPlatform:         FP.navPlatform,
+      hardwareConcurrency: FP.hardwareConcurrency,
+      deviceMemory:        FP.deviceMemory,
+      languages:           FP.languages,
+      webglVendor:         FP.webglVendor,
+      webglRenderer:       FP.webglRenderer,
+    });
+
+    // 注入 Cookies
+    const cookies = parseCookieString(cookieStr);
+    // Cookie 文件是当前 profile 登录态的唯一来源，避免 persistent context 残留旧账号凭证。
+    await ctx.clearCookies();
+    await ctx.addCookies(cookies);
+    logger.info(`已注入 ${cookies.length} 条 Cookie`);
+
+    // 使用已有 page 或新建
+    const pages = ctx.pages();
+    page = pages.length > 0 ? pages[0] : await ctx.newPage();
+
+    logger.ok('浏览器已就绪');
+  } catch (e) {
+    await discardContext();
+    throw e;
   }
-
-  const launchOptions = {
-    executablePath: process.env.CHROME_BIN || undefined,
-    headless: process.env.HEADLESS !== 'false',
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--memory-pressure-off',
-      '--js-flags=--max-old-space-size=256',
-      '--disable-extensions',
-      '--disable-default-apps',
-      '--single-process',
-      `--lang=${FP.locale}`,
-    ],
-    ignoreHTTPSErrors: false,
-    userAgent:  FP.userAgent,
-    locale:     FP.locale,
-    timezoneId: FP.timezoneId,
-    viewport:   FP.viewport,
-    deviceScaleFactor: 1,
-    extraHTTPHeaders: {
-      'Accept-Language': FP.acceptLanguage,
-    },
-  };
-
-  const proxy = secureProxy.getPlaywrightProxy();
-  if (proxy) {
-    launchOptions.proxy = proxy;
-    logger.info(`浏览器启用本机代理: ${secureProxy.redactProxyUrl(proxy.server)}`);
-  }
-
-  ctx = await chromium.launchPersistentContext(USER_DATA_DIR, launchOptions);
-
-  // 注入指纹隔离脚本（webdriver 隐藏 + navigator/WebGL 伪装）
-  await ctx.addInitScript(fingerprint.buildInitScript(FP), {
-    navPlatform:         FP.navPlatform,
-    hardwareConcurrency: FP.hardwareConcurrency,
-    deviceMemory:        FP.deviceMemory,
-    languages:           FP.languages,
-    webglVendor:         FP.webglVendor,
-    webglRenderer:       FP.webglRenderer,
-  });
-
-  // 注入 Cookies
-  const cookies = parseCookieString(cookieStr);
-  await ctx.addCookies(cookies);
-  logger.info(`已注入 ${cookies.length} 条 Cookie`);
-
-  // 使用已有 page 或新建
-  const pages = ctx.pages();
-  page = pages.length > 0 ? pages[0] : await ctx.newPage();
-
-  logger.ok('浏览器已就绪');
 }
 
 // 读取一篇帖子（随机偏态停留 + 随机滚动 + 帖子间随机间隔）
@@ -150,23 +274,67 @@ async function readPost(url) {
     return true;
   }
 
+  let target;
+  try { target = normalizePostUrl(url); } catch (e) {
+    logger.warn(`读帖失败: ${e.message} → [invalid post URL]`);
+    return false;
+  }
+
+  for (let attempt = 0; attempt <= READ_POST_RETRY_COUNT; attempt++) {
+    const result = await readPostOnce(target);
+    if (result.ok) {
+      if (attempt > 0) logger.ok(`读帖重试成功（第 ${attempt}/${READ_POST_RETRY_COUNT} 次重试）`);
+      return true;
+    }
+    if (!result.retryable || attempt === READ_POST_RETRY_COUNT) {
+      if (result.retryable) logger.warn(`当前帖子已完成 ${READ_POST_RETRY_COUNT} 次重试，准备跳过`);
+      return false;
+    }
+
+    if (result.resetPage) await resetPage();
+    const retryNumber = attempt + 1;
+    const delay = Math.min(READ_POST_RETRY_BASE_MS * (2 ** attempt), 20000);
+    logger.warn(`${result.reason}，${delay / 1000} 秒后进行第 ${retryNumber}/${READ_POST_RETRY_COUNT} 次重试`);
+    await sleep(delay);
+  }
+
+  return false;
+}
+
+async function readPostOnce(target) {
   try {
-    logger.info(`→ ${url}`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    logger.info(`→ ${target.pathname}`);
+    const navigationResponse = await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (!isV2exOrigin(page.url())) throw new Error('导航离开 V2EX，已拒绝继续处理');
 
     // 检测 Cloudflare 挑战页面
     const isCF = await detectCloudflareChallenge();
     if (isCF) {
       logger.warn('Cloudflare 挑战中，等待最多 60 秒...');
       const passed = await waitForCloudflare();
-      if (!passed) return false;
+      if (!passed) {
+        return { ok: false, retryable: true, resetPage: true, reason: 'Cloudflare 挑战未通过' };
+      }
+    }
+    const finalUrl = new URL(page.url());
+    if (finalUrl.origin !== V2EX_ORIGIN || finalUrl.pathname !== target.pathname) {
+      throw new Error('帖子导航未停留在目标页面');
+    }
+    if (!isCF && (!navigationResponse || !navigationResponse.ok())) {
+      throw new Error(`帖子页面返回 HTTP ${navigationResponse ? navigationResponse.status() : 'unknown'}`);
     }
 
     // 检测是否登录
     const content = await page.content();
-    if (content.includes('你要查看的页面需要先登录') || content.includes('需要先登录')) {
-      logger.error('Cookie 已失效，请重新获取');
-      return false;
+    const authState = profileAuth.diagnoseHomePage({ statusCode: 200, body: content });
+    if (!authState.ok) {
+      logger.error(`帖子页无法确认当前登录账号 (${authState.code || 'unknown'})`);
+      return {
+        ok: false,
+        retryable: authState.code !== 'logged_out',
+        resetPage: false,
+        reason: '帖子页登录状态暂时无法确认',
+      };
     }
 
     // 随机停留时长（偏态分布：多数偏短，偶尔长读）
@@ -182,13 +350,15 @@ async function readPost(url) {
     if (BEHAVIOR.memorySettleMs > 0) await sleep(BEHAVIOR.memorySettleMs);
     await sleep(randomHumanGapMs());
 
-    return true;
+    return { ok: true, retryable: false, resetPage: false, reason: '' };
   } catch (e) {
-    logger.warn(`读帖失败: ${e.message} → ${url}`);
-    if (shouldResetPage(e)) {
-      await resetPage();
-    }
-    return false;
+    logger.warn(`读帖失败: ${e.message} → ${target.pathname}`);
+    return {
+      ok: false,
+      retryable: true,
+      resetPage: shouldResetPage(e),
+      reason: '网络或页面导航异常',
+    };
   }
 }
 
@@ -215,9 +385,13 @@ function randomHumanGapMs() {
 
 function shouldResetPage(error) {
   const msg = String(error && error.message || '');
-  return msg.includes('ERR_TOO_MANY_REDIRECTS') ||
+  return msg.includes('Timeout') ||
+         msg.includes('ERR_TOO_MANY_REDIRECTS') ||
          msg.includes('ERR_HTTP_RESPONSE_CODE_FAILURE') ||
+         msg.includes('net::ERR_') ||
          msg.includes('Navigation to') ||
+         msg.includes('Target page, context or browser has been closed') ||
+         msg.includes('page.goto:') ||
          msg.includes('chrome-error://');
 }
 
@@ -228,12 +402,22 @@ async function resetPage() {
       await page.close({ runBeforeUnload: false });
     }
   } catch (_) {}
-  try {
-    page = await ctx.newPage();
-    logger.warn('已重建浏览器页面，后续将换帖继续');
-  } catch (e) {
-    logger.warn(`重建浏览器页面失败: ${e.message}`);
+  for (let attempt = 0; attempt <= BROWSER_IO_RETRY_COUNT; attempt++) {
+    try {
+      page = await ctx.newPage();
+      logger.warn('已重建浏览器页面，后续将重试或换帖继续');
+      return true;
+    } catch (e) {
+      if (attempt === BROWSER_IO_RETRY_COUNT) {
+        logger.warn(`重建浏览器页面经 ${BROWSER_IO_RETRY_COUNT} 次重试后仍失败: ${e.message}`);
+        return false;
+      }
+      const delay = BROWSER_IO_RETRY_BASE_MS * (2 ** attempt);
+      logger.warn(`重建浏览器页面失败，${delay / 1000} 秒后重试 (${attempt + 1}/${BROWSER_IO_RETRY_COUNT})`);
+      await sleep(delay);
+    }
   }
+  return false;
 }
 
 // 停留期间分多次随机向下滚动，模拟阅读时的视线移动
@@ -280,20 +464,32 @@ async function waitForCloudflare(timeout = 60000) {
 }
 
 // 将 Playwright context 的最新 Cookie 写回文件
-async function syncCookies() {
-  if (!ctx) return;
-  try {
-    const cookies = await ctx.cookies();
-    const str     = serializeCookies(cookies);
-    if (!str) return;
-    if (!hasCookieKey(str, 'A2')) {
-      logger.warn('Cookie 同步跳过：浏览器上下文缺少 A2，避免覆盖现有登录态');
-      return;
+async function syncCookies(options = {}) {
+  if (!ctx) return false;
+  for (let attempt = 0; attempt <= BROWSER_IO_RETRY_COUNT; attempt++) {
+    try {
+      const cookies = await ctx.cookies();
+      const str     = serializeCookies(cookies);
+      if (!str) return false;
+      if (!hasCookieKey(str, 'A2')) {
+        logger.warn('Cookie 同步跳过：浏览器上下文缺少 A2，避免覆盖现有登录态');
+        return false;
+      }
+      atomicWriteCookie(str);
+      return true;
+    } catch (e) {
+      if (attempt < BROWSER_IO_RETRY_COUNT) {
+        const delay = BROWSER_IO_RETRY_BASE_MS * (2 ** attempt);
+        logger.warn(`Cookie 同步失败，${delay / 1000} 秒后重试 (${attempt + 1}/${BROWSER_IO_RETRY_COUNT})`);
+        await sleep(delay);
+        continue;
+      }
+      if (options.throwOnError) throw e;
+      logger.warn(`Cookie 同步经 ${BROWSER_IO_RETRY_COUNT} 次重试后仍失败: ${e.message}`);
+      return false;
     }
-    atomicWriteCookie(str);
-  } catch (e) {
-    logger.warn(`Cookie 同步失败: ${e.message}`);
   }
+  return false;
 }
 
 function hasCookieKey(cookieStr, key) {
@@ -304,24 +500,24 @@ function hasCookieKey(cookieStr, key) {
 }
 
 function atomicWriteCookie(cookieStr) {
-  const dir = path.dirname(COOKIE_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${COOKIE_FILE}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, cookieStr, { mode: 0o600 });
-  fs.renameSync(tmp, COOKIE_FILE);
+  const current = fs.existsSync(COOKIE_FILE) ? fs.readFileSync(COOKIE_FILE, 'utf8').trim() : '';
+  if (current === cookieStr) return false;
+  config.writeFileAtomic(COOKIE_FILE, cookieStr, { mode: 0o600 });
+  return true;
 }
 
 // 获取当前 Cookie 字符串（供 balance.js / fetcher.js 使用）
-async function getCurrentCookie() {
+async function getCurrentCookie(options = {}) {
   if (ctx) {
     try {
       const cookies = await ctx.cookies();
       const str = serializeCookies(cookies);
       if (str && hasCookieKey(str, 'A2')) return str;
       if (str) {
-        logger.warn('当前浏览器上下文缺少 A2，回退读取 Cookie 文件');
+        logger.warn(`当前浏览器上下文缺少 A2${options.requireContextAuth ? '，不使用磁盘旧值' : '，回退读取 Cookie 文件'}`);
       }
     } catch (_) {}
+    if (options.requireContextAuth) return '';
   }
   // fallback: 直接读文件
   return fs.existsSync(COOKIE_FILE)
@@ -329,15 +525,52 @@ async function getCurrentCookie() {
     : '';
 }
 
-async function close() {
-  try {
-    if (ctx) {
-      await syncCookies();
-      await ctx.close();
+async function close(options = {}) {
+  let failure = null;
+  let closed = false;
+  if (ctx) {
+    try {
+      await syncCookies({ throwOnError: true });
+    } catch (e) {
+      failure = e;
+      logger.warn(`浏览器关闭前 Cookie 同步失败: ${e.message}`);
     }
-    logger.info('浏览器已关闭');
+    let closeFailure = null;
+    for (let attempt = 0; attempt <= BROWSER_IO_RETRY_COUNT; attempt++) {
+      try {
+        await ctx.close();
+        closed = true;
+        closeFailure = null;
+        break;
+      } catch (e) {
+        closeFailure = e;
+        if (attempt === BROWSER_IO_RETRY_COUNT) {
+          logger.warn(`关闭浏览器经 ${BROWSER_IO_RETRY_COUNT} 次重试后仍失败: ${e.message}`);
+          break;
+        }
+        const delay = BROWSER_IO_RETRY_BASE_MS * (2 ** attempt);
+        logger.warn(`关闭浏览器失败，${delay / 1000} 秒后重试 (${attempt + 1}/${BROWSER_IO_RETRY_COUNT})`);
+        await sleep(delay);
+      }
+    }
+    failure = failure || closeFailure;
+  }
+  ctx = null;
+  page = null;
+  if (closed) logger.info('浏览器已关闭');
+  if (closed) pruneBrowserCacheWithLog();
+  if (failure && options.throwOnError) throw failure;
+}
+
+async function discardContext() {
+  const current = ctx;
+  ctx = null;
+  page = null;
+  if (!current) return;
+  try {
+    await current.close();
   } catch (e) {
-    logger.warn(`关闭浏览器时出错: ${e.message}`);
+    logger.warn(`清理未完成的浏览器启动状态失败: ${e.message}`);
   }
 }
 
@@ -347,4 +580,16 @@ function getProfileInfo() {
   return { profile: PROFILE, cookieFile: COOKIE_FILE, fingerprint: FP, behavior: BEHAVIOR };
 }
 
-module.exports = { launch, readPost, getCurrentCookie, syncCookies, close, getProfileInfo };
+module.exports = {
+  launch,
+  readPost,
+  getCurrentCookie,
+  syncCookies,
+  close,
+  getProfileInfo,
+  buildLaunchArgs,
+  pruneBrowserCache,
+  shouldResetPage,
+  serializeCookies,
+  normalizePostUrl,
+};
