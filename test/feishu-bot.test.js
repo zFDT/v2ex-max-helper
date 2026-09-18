@@ -93,11 +93,13 @@ test('Feishu commands accept only the configured private chat', () => {
   assert.equal(isAuthorizedChat('different-chat', 'p2p'), false);
 });
 
-test('Feishu callback listener is loopback-only and debug reads are bounded', () => {
+test('Feishu callback listener defaults to loopback and debug reads are bounded', () => {
   const fs = require('node:fs');
   const path = require('node:path');
   const source = fs.readFileSync(path.resolve(__dirname, '..', 'reader', 'feishu-bot.js'), 'utf8');
-  assert.match(source, /server\.listen\(port, '127\.0\.0\.1'/);
+  // 默认必须仅监听回环；公网直连回调只能通过显式设置 FEISHU_BOT_HOST 打开。
+  assert.match(source, /FEISHU_BOT_HOST \|\| '127\.0\.0\.1'/);
+  assert.match(source, /server\.listen\(port, host/);
   assert.match(source, /MAX_DEBUG_READ_BYTES = 64 \* 1024/);
   assert.match(source, /server\.maxConnections = 64/);
   assert.match(source, /req\.on\('aborted'/);
