@@ -24,6 +24,7 @@ const fingerprint = require('./fingerprint');
 const config  = require('../lib/config');
 const profileAuth = require('../lib/profile-auth');
 const profileLock = require('../lib/profile-lock');
+const credentialHealth = require('../lib/credential-health');
 
 // ========== 配置 ==========
 const MAX_READ_COUNT    = 1000;   // 每日阅读上限（安全兜底）
@@ -197,6 +198,19 @@ async function shutdown(reason, stats, exitCode = 0, options = {}) {
   process.exit(exitCode);
 }
 
+// Cookie 探针失败时，用 PAT 心跳交叉验证账号本身是否还活着。
+// 未配置 PAT 时直接返回空结论，行为与改动前一致。
+async function diagnoseWithPat(failureCode) {
+  try {
+    const pat = credentialHealth.readPat(cfg);
+    if (!pat.value) return { code: 'unknown', advice: '' };
+    const status = await credentialHealth.readPatStatus(pat.value, { timeoutMs: 10000 });
+    return credentialHealth.explainCookieFailure(failureCode, status);
+  } catch (_) {
+    return { code: 'unknown', advice: '' };
+  }
+}
+
 async function verifyAndBindProfile(cookie) {
   const result = await retryRecoverable('验证 Profile 登录态', () => profileAuth.verifyAndCompare(cfg, cookie, {
     userAgent: FP.userAgent,
@@ -207,8 +221,12 @@ async function verifyAndBindProfile(cookie) {
     isRetryableError: isRecoverableNetworkError,
   });
   if (!result.ok) {
-    const error = new Error(`Profile ${cfg.profile} 认证失败: ${result.message}`);
+    const diagnosis = await diagnoseWithPat(result.code);
+    if (diagnosis.advice) logger.warn(`凭据交叉验证: ${diagnosis.advice}`);
+    const suffix = diagnosis.advice ? `（${diagnosis.advice}）` : '';
+    const error = new Error(`Profile ${cfg.profile} 认证失败: ${result.message}${suffix}`);
     if (result.code === 'cloudflare_challenge') error.code = 'CLOUDFLARE_CHALLENGE';
+    else if (diagnosis.code === 'cookie_expired_account_ok') error.code = 'COOKIE_EXPIRED_ACCOUNT_OK';
     throw error;
   }
   if (result.identityState === 'different') {
@@ -617,9 +635,11 @@ main().catch(async (e) => {
     stats.elapsed = activeStartTime ? elapsed(activeStartTime) : '0s';
     stats.reason = e.code === 'SESSION_EXPIRED'
       ? 'Chromium 登录态已失效，请更新 Cookie'
-      : e.code === 'CLOUDFLARE_CHALLENGE'
-        ? 'Cloudflare 托管挑战拦截认证探针，当前浏览器指纹或出口 IP 被判定为自动化客户端'
-        : '阅读进程遇到未捕获错误，请查看服务器日志';
+      : e.code === 'COOKIE_EXPIRED_ACCOUNT_OK'
+        ? 'Cookie 已失效（PAT 心跳确认账号本身正常），更新 Cookie 即可恢复'
+        : e.code === 'CLOUDFLARE_CHALLENGE'
+          ? 'Cloudflare 托管挑战拦截认证探针，当前浏览器指纹或出口 IP 被判定为自动化客户端'
+          : '阅读进程遇到未捕获错误，请查看服务器日志';
     try { await notify.notifyReaderError(stats); } catch (_) {}
   }
   process.exit(1);

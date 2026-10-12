@@ -30,6 +30,7 @@ const config = require('../lib/config');
 const profileAuth = require('../lib/profile-auth');
 const profileLock = require('../lib/profile-lock');
 const fingerprint = require('../reader/fingerprint');
+const credentialHealth = require('../lib/credential-health');
 
 // ========== 配置 ==========
 const SCRIPT_VERSION = 'v1.4.12';
@@ -465,6 +466,33 @@ function notify(title, msg) {
   ]);
 }
 
+// ========== 凭据健康度 ==========
+// Cookie 剩余寿命推算 + PAT 心跳。PAT 未配置时 readPat 返回空值，
+// 相关分支自动退化为原有的「未知」结论，不改变既有行为。
+async function readPatStatusSafe() {
+  const pat = credentialHealth.readPat(cfg);
+  if (!pat.value) return { configured: false, ok: false, code: 'pat_missing', warnings: [] };
+  try {
+    return await credentialHealth.readPatStatus(pat.value, { timeoutMs: 10000 });
+  } catch (_) {
+    return { configured: true, ok: false, code: 'pat_network', warnings: [] };
+  }
+}
+
+async function reportCredentialHealth(cookie) {
+  try {
+    const report = await credentialHealth.assess({ cfg, cookie, timeoutMs: 10000 });
+    for (const warning of report.warnings) log(`⚠️  ${warning}`);
+    if (report.warnings.length > 0) {
+      await notify('V2EX ⚠️ 凭据到期预警', report.warnings.join('\n'));
+    }
+    return report;
+  } catch (e) {
+    log(`⚠️  凭据健康检查失败: ${e.message}`);
+    return null;
+  }
+}
+
 // ========== 解析函数 ==========
 function formatBalance(html) {
   if (!html) return '';
@@ -573,8 +601,11 @@ async function doPing(attempt = 0) {
     const status = parseLoginStatus(html);
     if (!status.logged_in) {
       if (status.definitive) {
+        const cross = credentialHealth.explainCookieFailure('logged_out', await readPatStatusSafe());
         log('❌ Cookie 已失效（保活检测）');
-        await notify('V2EX ⚠️ Cookie 失效', '请重新登录 V2EX 并更新 Cookie，签到将中断！');
+        await notify('V2EX ⚠️ Cookie 失效', cross.advice
+          ? `保活检测失败。${cross.advice}`
+          : '请重新登录 V2EX 并更新 Cookie，签到将中断！');
         log('📢 告警已发送（如已配置推送）');
         process.exitCode = 1;
       } else {
@@ -626,9 +657,12 @@ async function doCheckin(attempt = 0) {
     let activeCookie = info.cookie || readCookie() || cookie;
 
     if (!info.logged_in) {
+      const cross = credentialHealth.explainCookieFailure('logged_out', await readPatStatusSafe());
       logField('Status', '❌ Cookie 已失效');
       log('📢 发送失效告警...');
-      await notify('V2EX ❌ Cookie 失效', '签到失败，请重新登录 V2EX 更新 Cookie！连续天数将中断。');
+      await notify('V2EX ❌ Cookie 失效', cross.advice
+        ? `签到失败。${cross.advice}`
+        : '签到失败，请重新登录 V2EX 更新 Cookie！连续天数将中断。');
       sep();
       log('📊 Summary\nFailed     : 1\n🎯 Result  : Cookie 已失效');
       process.exit(1);
@@ -642,6 +676,7 @@ async function doCheckin(attempt = 0) {
       if (balance) logField('Balance', balance);
       sep();
       log(`📊 Summary\nDuplicate  : 1\n🎯 Result  : 今日已签到`);
+      await reportCredentialHealth(activeCookie);
       return;
     }
 
@@ -674,6 +709,7 @@ async function doCheckin(attempt = 0) {
     if (balance) logField('Balance', balance);
     sep();
     log(`📊 Summary\nSuccess    : 1\n🎯 Result  : 签到成功`);
+    await reportCredentialHealth(activeCookie);
 
   } catch (e) {
     if (attempt + 1 < MAX_ATTEMPTS) {
