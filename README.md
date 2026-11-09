@@ -400,3 +400,30 @@ rm -f ~/.v2ex_cookie ~/.v2ex_env
 ## ⭐ Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=mskatoni/v2ex-max-helper&type=Date)](https://www.star-history.com/#mskatoni/v2ex-max-helper&Date)
+
+## 我的贡献与复盘
+
+> 本仓库是 [zFDT](https://github.com/zFDT) 对上游 [mskatoni/v2ex-max-helper](https://github.com/mskatoni/v2ex-max-helper) 的 **fork**，用于在其基础上继续学习、使用与贡献。
+
+### 个人贡献
+
+以 fork 的形式参与上游协作，累计提交 **4 个 PR，全部被合并进上游**：
+
+| PR | 主题 |
+|----|------|
+| [#3](https://github.com/mskatoni/v2ex-max-helper/pull/3) | 飞书通知与代理配置相关讨论及代码参考 |
+| [#6](https://github.com/mskatoni/v2ex-max-helper/pull/6) | 功能与文档改进 |
+| [#9](https://github.com/mskatoni/v2ex-max-helper/pull/9) | 功能与文档改进 |
+| [#10](https://github.com/mskatoni/v2ex-max-helper/pull/10) | 功能与文档改进 |
+
+这 4 个 PR 是开源贡献的硬证据：从发现问题、提交修复，到响应上游 review 并最终合入，完整走通了 GitHub 协作流程。
+
+### 收获与规划
+
+- **实践了开源协作**：学会提 PR、按上游规范组织提交、响应 review 意见并迭代。
+- **加深了对项目的理解**：在阅读与改进代码的过程中，熟悉了 V2EX 签到 / 阅读 / Bot 的完整链路与多账号、指纹隔离、代理等设计。
+- **后续规划**：继续跟进上游更新，结合个人使用场景补充文档与自动化，保持与上游同步。
+
+### 说明
+
+- 本 fork 主要保留上游能力，并在此基础上做个人化的使用与文档沉淀；许可证与原作者署名保持上游一致（CC BY-NC-SA 4.0）。
